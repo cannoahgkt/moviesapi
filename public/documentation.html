@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>API Documentation</title>
+</head>
+
+<body>
+  <h1>API Documentation</h1>
+
+  <h2>Movies</h2>
+  <table border="1">
+    <tr>
+      <th>Request</th>
+      <th>URL</th>
+      <th>Response</th>
+      <th>Parameters</th>
+      <th>Example Request</th>
+      <th>Example Response</th>
+    </tr>
+    <tr>
+      <td>GET</td>
+      <td>/movies</td>
+      <td>Get information about all movies</td>
+      <td>None</td>
+      <td><code>GET /movies</code></td>
+      <td>
+        <pre>
+        {
+          "movies": [
+            {
+              "title": "Treasure Planet",
+              "director": "John Musker, Ron Clements",
+              "genre": "Animation",
+              "year": 2002,
+              "description": "Animated adventure",
+              "imageUrl": "https://example.com/treasureplanet.jpg",
+              "featured": true
+            },
+            {
+              "title": "Star Wars: Episode III - Revenge of the Sith",
+              "director": "George Lucas",
+              "genre": "Sci-Fi",
+              "year": 2005,
+              "description": "Epic space opera",
+              "imageUrl": "https://example.com/revengeofthesith.jpg",
+              "featured": true
+            },
+            {
+              "title": "Spider-Man: No Way Home",
+              "director": "Jon Watts",
+              "genre": "Action",
+              "year": 2021,
+              "description": "Superhero blockbuster",
+              "imageUrl": "https://example.com/spidermannowayhome.jpg",
+              "featured": true
+            },
+            // ... other movies
+          ]
+        }
+        </pre>
+      </td>
+    </tr>
+  </table>
+
+  <h2>Users</h2>
+<table border="1">
+  <tr>
+    <th>Action</th>
+    <th>URL</th>
+    <th>HTTP Method</th>
+    <th>Parameters</th>
+    <th>Request Example</th>
+    <th>Response Example</th>
+  </tr>
+  <tr>
+    <td>Return data about a single user by username</td>
+    <td>/users/[Username]</td>
+    <td>GET</td>
+    <td>None</td>
+    <td><code>GET /users/JohnDoe</code></td>
+    <td>
+      <pre>
+      {
+        "_id": "654955e502d2f93ced6e02cc",
+        "Username": "JohnDoe",
+        "Password": "securepass",
+        "Email": "john.doe@email.com",
+        "Birthday": "1995-08-25T00:00:00.000Z",
+        "FavoriteMovies": [
+          "6549494c02d2f93ced6e02c3",
+          "65494a9102d2f93ced6e02c4"
+        ]
+      }
+      </pre>
+    </td>
+  </tr>
+  <tr>
+    <td>Allow new users to register</td>
+    <td>/users</td>
+    <td>POST</td>
+    <td>A JSON object holding data about the user to add</td>
+    <td>
+      <pre>
+      {
+        "Username": "NewUser123",
+        "Password": "newpass321",
+        "Email": "new.user@mail.com",
+        "Birthday": "1992-11-07T00:00:00.000Z"
+      }
+      </pre>
+    </td>
+    <td>
+      <pre>
+      {
+        "Username": "NewUser123",
+        "Password": "newpass321",
+        "Email": "new.user@mail.com",
+        "FavoriteMovies": [],
+        "_id": "654b8b77d73c652a6f31a9f2",
+        "__v": 0
+      }
+      </pre>
+    </td>
+  </tr>
+</table>
+
+</body>
+
+</html>

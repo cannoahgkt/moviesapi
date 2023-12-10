@@ -4,6 +4,7 @@ const bodyParser = require('body-parser');
 const cors = require('cors');
 const passport = require('./passport');
 const authRouter = require('./auth');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -36,6 +37,7 @@ app.post('/users', async (req, res) => {
     console.error(error);
     res.status(500).send('Internal Server Error');
   }
+  
 });
 
 // Existing /movies and /users routes
@@ -88,10 +90,11 @@ app.get('/', (req, res) => {
 // Define the login route
 app.post('/login', (req, res, next) => {
   passport.authenticate('local', { session: false }, (err, user, info) => {
-    if (err || !user) {
-      return res.status(400).json({
-        message: 'Invalid username or password',
-      });
+    if (err) {
+        return res.status(500).json({ message: 'Internal Server Error' });
+    }
+    if (!user) {
+        return res.status(401).json({ message: 'Invalid username or password' });
     }
 
     // If authentication is successful, generate and return a JWT token
@@ -99,6 +102,14 @@ app.post('/login', (req, res, next) => {
     return res.json({ token });
   })(req, res, next);
 });
+
+function generateJWTToken(user) {
+  const payload = {
+    sub: user._id,
+    username: user.username,
+  };
+  return jwt.sign(payload, 'hG7zPwIVrs', { expiresIn: '1h' });
+}
 
 // Error handling middleware and starting the server
 app.use((err, req, res, next) => {

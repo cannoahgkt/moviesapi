@@ -5,12 +5,31 @@ const cors = require('cors');
 const passport = require('./passport');
 const authRouter = require('./auth');
 const jwt = require('jsonwebtoken');
+const { check, validationResult } = require('express-validator');
 
 const app = express();
 const port = process.env.PORT || 3000;
+app.listen(port, '0.0.0.0',() => {
+  console.log('Listening on Port ' + port);
+ });
 
 app.use(bodyParser.json());
 app.use(cors());
+
+
+// Creates a list of allowed domains
+let allowedOrigins = ['http://localhost:3000', 'http://testsite.com'];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if(!origin) return callback(null, true);
+    if(allowedOrigins.indexOf(origin) === -1){ // If a specific origin isn’t found on the list of allowed origins
+      let message = 'The CORS policy for this application doesn’t allow access from origin ' + origin;
+      return callback(new Error(message ), false);
+    }
+    return callback(null, true);
+  }
+}));
 
 // Connect to MongoDB using Mongoose
 mongoose.connect('mongodb://localhost:27017/myDatabase', { useNewUrlParser: true, useUnifiedTopology: true });

@@ -31,7 +31,7 @@ app.use(cors({
 }));
 
 // Connect to MongoDB using Mongoose
-mongoose.connect('mongodb+srv://cannoah:NKcJpeB1M6jcUKix@cluster0.njmial8.mongodb.net/?retryWrites=true&w=majority', { useNewUrlParser: true, useUnifiedTopology: true });
+mongoose.connect('process.env.CONNECTION_URI', { useNewUrlParser: true, useUnifiedTopology: true });
 
 // Import Mongoose models
 const { Movie, User } = require('./models');

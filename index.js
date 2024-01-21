@@ -15,7 +15,6 @@ app.listen(port, '0.0.0.0', () => {
 });
 
 app.use(bodyParser.json());
-app.use(cors());
 
 // Creates a list of allowed domains
 let allowedOrigins = ['http://localhost:3000', 'http://testsite.com'];

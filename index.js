@@ -65,6 +65,7 @@ app.post('/users', [
   }
 });
 
+
 // Existing /movies and /users routes
 app.get('/movies', async (req, res) => {
   try {

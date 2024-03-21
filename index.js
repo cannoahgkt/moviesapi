@@ -16,8 +16,8 @@ app.listen(port, '0.0.0.0', () => {
 app.use(bodyParser.json());
 
 // Use Cross-Origin Resource Sharing
-/*const cors = require("cors");
-app.use(cors());*/
+const cors = require("cors");
+/*app.use(cors());*/
 
 // Creates a list of allowed domains
 let allowedOrigins = ['http://127.0.0.1:3000', 'http://testsite.com', 'https://myflixonline.netlify.app'];

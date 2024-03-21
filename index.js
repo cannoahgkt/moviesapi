@@ -8,7 +8,7 @@ const { body, validationResult } = require('express-validator');
 const mongoURI = process.env.MONGODB_URI || 'mongodb+srv://cannoah:NKcJpeB1M6jcUKix@cluster0.njmial8.mongodb.net/?retryWrites=true';
 
 const app = express();
-const port = process.env.PORT || 3000;
+const port = process.env.PORT || 3000 || 39748;
 app.listen(port, '0.0.0.0', () => {
   console.log('Listening on Port ' + port);
 });

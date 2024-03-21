@@ -125,7 +125,7 @@ app.post('/login', (req, res, next) => {
         return res.status(401).json({ message: 'Invalid username or password' });
     }
 
-    // If authentication is successful, generate and return a JWT token
+   
     const token = generateJWTToken(user);
     return res.json({ user, token });
   })(req, res, next);

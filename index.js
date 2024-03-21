@@ -127,7 +127,7 @@ app.post('/login', (req, res, next) => {
 
     // If authentication is successful, generate and return a JWT token
     const token = generateJWTToken(user);
-    return res.json({ token });
+    return res.json({ user, token });
   })(req, res, next);
 });
 

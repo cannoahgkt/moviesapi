@@ -1,7 +1,6 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const bodyParser = require('body-parser');
-const cors = require('cors');
 const passport = require('./passport');
 const authRouter = require('./auth');
 const jwt = require('jsonwebtoken');
@@ -16,8 +15,12 @@ app.listen(port, '0.0.0.0', () => {
 
 app.use(bodyParser.json());
 
+// Use Cross-Origin Resource Sharing
+const cors = require("cors");
+app.use(cors());
+
 // Creates a list of allowed domains
-let allowedOrigins = ['*', 'http://127.0.0.1:3000', 'http://testsite.com'];
+/*let allowedOrigins = ['http://127.0.0.1:3000', 'http://testsite.com', 'https://myflixonline.netlify.app'];
 
 app.use(cors({
   origin: (origin, callback) => {
@@ -28,8 +31,7 @@ app.use(cors({
     }
     return callback(null, true);
   }
-}));
-
+}));*/
 
 // Connect to MongoDB using Mongoose
 mongoose.connect(mongoURI, { useNewUrlParser: true, useUnifiedTopology: true });
@@ -64,6 +66,7 @@ app.post('/users', [
     res.status(500).send('Internal Server Error');
   }
 });
+
 
 // Existing /movies and /users routes
 app.get('/movies', passport.authenticate('jwt', { session: false }), async (req, res) => {
@@ -122,7 +125,7 @@ app.post('/login', (req, res, next) => {
         return res.status(401).json({ message: 'Invalid username or password' });
     }
 
-    // If authentication is successful, generate and return a JWT token
+   
     const token = generateJWTToken(user);
     return res.json({ user, token });
   })(req, res, next);

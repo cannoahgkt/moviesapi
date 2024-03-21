@@ -17,10 +17,10 @@ app.use(bodyParser.json());
 
 // Use Cross-Origin Resource Sharing
 const cors = require("cors");
-/*app.use(cors());*/
+app.use(cors());
 
 // Creates a list of allowed domains
-let allowedOrigins = ['http://127.0.0.1:3000', 'http://testsite.com', 'https://myflixonline.netlify.app'];
+/*let allowedOrigins = ['http://127.0.0.1:3000', 'http://testsite.com', 'https://myflixonline.netlify.app'];
 
 app.use(cors({
   origin: (origin, callback) => {
@@ -31,7 +31,7 @@ app.use(cors({
     }
     return callback(null, true);
   }
-}));
+}));*/
 
 // Connect to MongoDB using Mongoose
 mongoose.connect(mongoURI, { useNewUrlParser: true, useUnifiedTopology: true });

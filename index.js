@@ -1,11 +1,12 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const bodyParser = require('body-parser');
+const cors = require('cors');
 const passport = require('./passport');
 const authRouter = require('./auth');
 const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
-const mongoURI = process.env.CONNECTION_URI || 'mongodb+srv://cannoah:NKcJpeB1M6jcUKix@cluster0.njmial8.mongodb.net/?retryWrites=true';
+const mongoURI = process.env.MONGODB_URI || 'mongodb+srv://cannoah:NKcJpeB1M6jcUKix@cluster0.njmial8.mongodb.net/?retryWrites=true';
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -19,8 +20,8 @@ app.use(bodyParser.json());
 const cors = require("cors");
 app.use(cors());
 
-
-/*let allowedOrigins = ['http://127.0.0.1:3000', 'http://testsite.com', 'https://myflixonline.netlify.app'];
+// Creates a list of allowed domains
+/*let allowedOrigins = ['*', 'http://127.0.0.1:3000', 'http://testsite.com', 'https://myflixonline.netlify.app'];
 
 app.use(cors({
   origin: (origin, callback) => {
@@ -32,6 +33,7 @@ app.use(cors({
     return callback(null, true);
   }
 }));*/
+
 
 // Connect to MongoDB using Mongoose
 mongoose.connect(mongoURI, { useNewUrlParser: true, useUnifiedTopology: true });
@@ -69,7 +71,7 @@ app.post('/users', [
 
 
 // Existing /movies and /users routes
-app.get('/movies', passport.authenticate('jwt', { session: false }), async (req, res) => {
+app.get('/movies', async (req, res) => {
   try {
     const movies = await Movie.find();
     res.json({ movies });
@@ -125,7 +127,7 @@ app.post('/login', (req, res, next) => {
         return res.status(401).json({ message: 'Invalid username or password' });
     }
 
-   
+    // If authentication is successful, generate and return a JWT token
     const token = generateJWTToken(user);
     return res.json({ user, token });
   })(req, res, next);

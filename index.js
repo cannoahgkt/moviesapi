@@ -19,7 +19,7 @@ app.use(bodyParser.json());
 const cors = require("cors");
 app.use(cors());
 
-// Creates a list of allowed domains
+
 /*let allowedOrigins = ['http://127.0.0.1:3000', 'http://testsite.com', 'https://myflixonline.netlify.app'];
 
 app.use(cors({

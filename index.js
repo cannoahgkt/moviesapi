@@ -5,7 +5,7 @@ const passport = require('./passport');
 const authRouter = require('./auth');
 const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
-const mongoURI = process.env.MONGODB_URI || 'mongodb+srv://cannoah:NKcJpeB1M6jcUKix@cluster0.njmial8.mongodb.net/?retryWrites=true';
+const mongoURI = process.env.CONNECTION_URI || 'mongodb+srv://cannoah:NKcJpeB1M6jcUKix@cluster0.njmial8.mongodb.net/?retryWrites=true';
 
 const app = express();
 const port = process.env.PORT || 3000;

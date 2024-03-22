@@ -9,8 +9,8 @@ const mongoURI = process.env.CONNECTION_URI || 'mongodb+srv://cannoah:NKcJpeB1M6
 
 const app = express();
 const port = process.env.PORT || 3000;
-app.listen(port, () => {
-    console.log(`Server is running on port ${port}`);
+app.listen(port, '0.0.0.0', () => {
+  console.log('Listening on Port ' + port);
 });
 
 app.use(bodyParser.json());

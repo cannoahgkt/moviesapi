@@ -9,9 +9,9 @@ const mongoURI = process.env.MONGODB_URI || 'mongodb+srv://cannoah:NKcJpeB1M6jcU
 
 const app = express();
 const port = process.env.PORT || 3000;
-app.listen(port, '0.0.0.0', () => {
+/*app.listen(port, '0.0.0.0', () => {
   console.log('Listening on Port ' + port);
-});
+});*/
 
 app.use(bodyParser.json());
 

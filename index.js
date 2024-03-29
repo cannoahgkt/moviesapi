@@ -9,30 +9,13 @@ const mongoURI = process.env.MONGODB_URI;
 
 const app = express();
 const port = process.env.PORT || 3000;
-/*app.listen(port, '0.0.0.0', () => {
-  console.log('Listening on Port ' + port);
-});*/
+
 
 app.use(bodyParser.json());
 
 // Use Cross-Origin Resource Sharing
 const cors = require("cors");
 app.use(cors());
-
-// Creates a list of allowed domains
-/*let allowedOrigins = ['*', 'http://127.0.0.1:3000', 'http://testsite.com', 'https://myflixonline.netlify.app'];
-
-app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) === -1) {
-      let message = 'The CORS policy for this application doesn’t allow access from origin ' + origin;
-      return callback(new Error(message), false);
-    }
-    return callback(null, true);
-  }
-}));*/
-
 
 // Connect to MongoDB using Mongoose
 mongoose.connect(mongoURI, { useNewUrlParser: true, useUnifiedTopology: true });

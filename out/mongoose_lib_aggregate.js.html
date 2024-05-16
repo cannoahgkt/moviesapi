@@ -1,0 +1,1245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>JSDoc: Source: mongoose/lib/aggregate.js</title>
+
+    <script src="scripts/prettify/prettify.js"> </script>
+    <script src="scripts/prettify/lang-css.js"> </script>
+    <!--[if lt IE 9]>
+      <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+    <link type="text/css" rel="stylesheet" href="styles/prettify-tomorrow.css">
+    <link type="text/css" rel="stylesheet" href="styles/jsdoc-default.css">
+</head>
+
+<body>
+
+<div id="main">
+
+    <h1 class="page-title">Source: mongoose/lib/aggregate.js</h1>
+
+    
+
+
+
+    
+    <section>
+        <article>
+            <pre class="prettyprint source linenums"><code>'use strict';
+
+/*!
+ * Module dependencies
+ */
+
+const AggregationCursor = require('./cursor/aggregationCursor');
+const MongooseError = require('./error/mongooseError');
+const Query = require('./query');
+const { applyGlobalMaxTimeMS, applyGlobalDiskUse } = require('./helpers/query/applyGlobalOption');
+const clone = require('./helpers/clone');
+const getConstructorName = require('./helpers/getConstructorName');
+const prepareDiscriminatorPipeline = require('./helpers/aggregate/prepareDiscriminatorPipeline');
+const stringifyFunctionOperators = require('./helpers/aggregate/stringifyFunctionOperators');
+const utils = require('./utils');
+const read = Query.prototype.read;
+const readConcern = Query.prototype.readConcern;
+
+const validRedactStringValues = new Set(['$$DESCEND', '$$PRUNE', '$$KEEP']);
+
+/**
+ * Aggregate constructor used for building aggregation pipelines. Do not
+ * instantiate this class directly, use [Model.aggregate()](https://mongoosejs.com/docs/api/model.html#Model.aggregate()) instead.
+ *
+ * #### Example:
+ *
+ *     const aggregate = Model.aggregate([
+ *       { $project: { a: 1, b: 1 } },
+ *       { $skip: 5 }
+ *     ]);
+ *
+ *     Model.
+ *       aggregate([{ $match: { age: { $gte: 21 }}}]).
+ *       unwind('tags').
+ *       exec();
+ *
+ * #### Note:
+ *
+ * - The documents returned are plain javascript objects, not mongoose documents (since any shape of document can be returned).
+ * - Mongoose does **not** cast pipeline stages. The below will **not** work unless `_id` is a string in the database
+ *
+ *     new Aggregate([{ $match: { _id: '00000000000000000000000a' } }]);
+ *     // Do this instead to cast to an ObjectId
+ *     new Aggregate([{ $match: { _id: new mongoose.Types.ObjectId('00000000000000000000000a') } }]);
+ *
+ * @see MongoDB https://www.mongodb.com/docs/manual/applications/aggregation/
+ * @see driver https://mongodb.github.io/node-mongodb-native/4.9/classes/Collection.html#aggregate
+ * @param {Array} [pipeline] aggregation pipeline as an array of objects
+ * @param {Model} [model] the model to use with this aggregate.
+ * @api public
+ */
+
+function Aggregate(pipeline, model) {
+  this._pipeline = [];
+  this._model = model;
+  this.options = {};
+
+  if (arguments.length === 1 &amp;&amp; Array.isArray(pipeline)) {
+    this.append.apply(this, pipeline);
+  }
+}
+
+/**
+ * Contains options passed down to the [aggregate command](https://www.mongodb.com/docs/manual/reference/command/aggregate/).
+ * Supported options are:
+ *
+ * - [`allowDiskUse`](https://mongoosejs.com/docs/api/aggregate.html#Aggregate.prototype.allowDiskUse())
+ * - `bypassDocumentValidation`
+ * - [`collation`](https://mongoosejs.com/docs/api/aggregate.html#Aggregate.prototype.collation())
+ * - `comment`
+ * - [`cursor`](https://mongoosejs.com/docs/api/aggregate.html#Aggregate.prototype.cursor())
+ * - [`explain`](https://mongoosejs.com/docs/api/aggregate.html#Aggregate.prototype.explain())
+ * - `fieldsAsRaw`
+ * - [`hint`](https://mongoosejs.com/docs/api/aggregate.html#Aggregate.prototype.hint())
+ * - `let`
+ * - `maxTimeMS`
+ * - `raw`
+ * - [`readConcern`](https://mongoosejs.com/docs/api/aggregate.html#Aggregate.prototype.readConcern())
+ * - `readPreference`
+ * - [`session`](https://mongoosejs.com/docs/api/aggregate.html#Aggregate.prototype.session())
+ * - `writeConcern`
+ *
+ * @property options
+ * @memberOf Aggregate
+ * @api public
+ */
+
+Aggregate.prototype.options;
+
+/**
+ * Get/set the model that this aggregation will execute on.
+ *
+ * #### Example:
+ *
+ *     const aggregate = MyModel.aggregate([{ $match: { answer: 42 } }]);
+ *     aggregate.model() === MyModel; // true
+ *
+ *     // Change the model. There's rarely any reason to do this.
+ *     aggregate.model(SomeOtherModel);
+ *     aggregate.model() === SomeOtherModel; // true
+ *
+ * @param {Model} [model] Set the model associated with this aggregate. If not provided, returns the already stored model.
+ * @return {Model}
+ * @api public
+ */
+
+Aggregate.prototype.model = function(model) {
+  if (arguments.length === 0) {
+    return this._model;
+  }
+
+  this._model = model;
+  if (model.schema != null) {
+    if (this.options.readPreference == null &amp;&amp;
+      model.schema.options.read != null) {
+      this.options.readPreference = model.schema.options.read;
+    }
+    if (this.options.collation == null &amp;&amp;
+      model.schema.options.collation != null) {
+      this.options.collation = model.schema.options.collation;
+    }
+  }
+
+  return model;
+};
+
+/**
+ * Appends new operators to this aggregate pipeline
+ *
+ * #### Example:
+ *
+ *     aggregate.append({ $project: { field: 1 }}, { $limit: 2 });
+ *
+ *     // or pass an array
+ *     const pipeline = [{ $match: { daw: 'Logic Audio X' }} ];
+ *     aggregate.append(pipeline);
+ *
+ * @param {...Object|Object[]} ops operator(s) to append. Can either be a spread of objects or a single parameter of a object array.
+ * @return {Aggregate}
+ * @api public
+ */
+
+Aggregate.prototype.append = function() {
+  const args = (arguments.length === 1 &amp;&amp; Array.isArray(arguments[0]))
+    ? arguments[0]
+    : [...arguments];
+
+  if (!args.every(isOperator)) {
+    throw new Error('Arguments must be aggregate pipeline operators');
+  }
+
+  this._pipeline = this._pipeline.concat(args);
+
+  return this;
+};
+
+/**
+ * Appends a new $addFields operator to this aggregate pipeline.
+ * Requires MongoDB v3.4+ to work
+ *
+ * #### Example:
+ *
+ *     // adding new fields based on existing fields
+ *     aggregate.addFields({
+ *         newField: '$b.nested'
+ *       , plusTen: { $add: ['$val', 10]}
+ *       , sub: {
+ *            name: '$a'
+ *         }
+ *     })
+ *
+ *     // etc
+ *     aggregate.addFields({ salary_k: { $divide: [ "$salary", 1000 ] } });
+ *
+ * @param {Object} arg field specification
+ * @see $addFields https://www.mongodb.com/docs/manual/reference/operator/aggregation/addFields/
+ * @return {Aggregate}
+ * @api public
+ */
+Aggregate.prototype.addFields = function(arg) {
+  if (typeof arg !== 'object' || arg === null || Array.isArray(arg)) {
+    throw new Error('Invalid addFields() argument. Must be an object');
+  }
+  return this.append({ $addFields: Object.assign({}, arg) });
+};
+
+/**
+ * Appends a new $project operator to this aggregate pipeline.
+ *
+ * Mongoose query [selection syntax](https://mongoosejs.com/docs/api/query.html#Query.prototype.select()) is also supported.
+ *
+ * #### Example:
+ *
+ *     // include a, include b, exclude _id
+ *     aggregate.project("a b -_id");
+ *
+ *     // or you may use object notation, useful when
+ *     // you have keys already prefixed with a "-"
+ *     aggregate.project({a: 1, b: 1, _id: 0});
+ *
+ *     // reshaping documents
+ *     aggregate.project({
+ *         newField: '$b.nested'
+ *       , plusTen: { $add: ['$val', 10]}
+ *       , sub: {
+ *            name: '$a'
+ *         }
+ *     })
+ *
+ *     // etc
+ *     aggregate.project({ salary_k: { $divide: [ "$salary", 1000 ] } });
+ *
+ * @param {Object|String} arg field specification
+ * @see projection https://www.mongodb.com/docs/manual/reference/aggregation/project/
+ * @return {Aggregate}
+ * @api public
+ */
+
+Aggregate.prototype.project = function(arg) {
+  const fields = {};
+
+  if (typeof arg === 'object' &amp;&amp; !Array.isArray(arg)) {
+    Object.keys(arg).forEach(function(field) {
+      fields[field] = arg[field];
+    });
+  } else if (arguments.length === 1 &amp;&amp; typeof arg === 'string') {
+    arg.split(/\s+/).forEach(function(field) {
+      if (!field) {
+        return;
+      }
+      const include = field[0] === '-' ? 0 : 1;
+      if (include === 0) {
+        field = field.substring(1);
+      }
+      fields[field] = include;
+    });
+  } else {
+    throw new Error('Invalid project() argument. Must be string or object');
+  }
+
+  return this.append({ $project: fields });
+};
+
+/**
+ * Appends a new custom $group operator to this aggregate pipeline.
+ *
+ * #### Example:
+ *
+ *     aggregate.group({ _id: "$department" });
+ *
+ * @see $group https://www.mongodb.com/docs/manual/reference/aggregation/group/
+ * @method group
+ * @memberOf Aggregate
+ * @instance
+ * @param {Object} arg $group operator contents
+ * @return {Aggregate}
+ * @api public
+ */
+
+/**
+ * Appends a new custom $match operator to this aggregate pipeline.
+ *
+ * #### Example:
+ *
+ *     aggregate.match({ department: { $in: [ "sales", "engineering" ] } });
+ *
+ * @see $match https://www.mongodb.com/docs/manual/reference/aggregation/match/
+ * @method match
+ * @memberOf Aggregate
+ * @instance
+ * @param {Object} arg $match operator contents
+ * @return {Aggregate}
+ * @api public
+ */
+
+/**
+ * Appends a new $skip operator to this aggregate pipeline.
+ *
+ * #### Example:
+ *
+ *     aggregate.skip(10);
+ *
+ * @see $skip https://www.mongodb.com/docs/manual/reference/aggregation/skip/
+ * @method skip
+ * @memberOf Aggregate
+ * @instance
+ * @param {Number} num number of records to skip before next stage
+ * @return {Aggregate}
+ * @api public
+ */
+
+/**
+ * Appends a new $limit operator to this aggregate pipeline.
+ *
+ * #### Example:
+ *
+ *     aggregate.limit(10);
+ *
+ * @see $limit https://www.mongodb.com/docs/manual/reference/aggregation/limit/
+ * @method limit
+ * @memberOf Aggregate
+ * @instance
+ * @param {Number} num maximum number of records to pass to the next stage
+ * @return {Aggregate}
+ * @api public
+ */
+
+
+/**
+ * Appends a new $densify operator to this aggregate pipeline.
+ *
+ * #### Example:
+ *
+ *      aggregate.densify({
+ *        field: 'timestamp',
+ *        range: {
+ *          step: 1,
+ *          unit: 'hour',
+ *          bounds: [new Date('2021-05-18T00:00:00.000Z'), new Date('2021-05-18T08:00:00.000Z')]
+ *        }
+ *      });
+ *
+ * @see $densify https://www.mongodb.com/docs/manual/reference/operator/aggregation/densify/
+ * @method densify
+ * @memberOf Aggregate
+ * @instance
+ * @param {Object} arg $densify operator contents
+ * @return {Aggregate}
+ * @api public
+ */
+
+/**
+ * Appends a new $fill operator to this aggregate pipeline.
+ *
+ * #### Example:
+ *
+ *      aggregate.fill({
+ *        output: {
+ *          bootsSold: { value: 0 },
+ *          sandalsSold: { value: 0 },
+ *          sneakersSold: { value: 0 }
+ *        }
+ *      });
+ *
+ * @see $fill https://www.mongodb.com/docs/manual/reference/operator/aggregation/fill/
+ * @method fill
+ * @memberOf Aggregate
+ * @instance
+ * @param {Object} arg $fill operator contents
+ * @return {Aggregate}
+ * @api public
+ */
+
+/**
+ * Appends a new $geoNear operator to this aggregate pipeline.
+ *
+ * #### Note:
+ *
+ * **MUST** be used as the first operator in the pipeline.
+ *
+ * #### Example:
+ *
+ *     aggregate.near({
+ *       near: { type: 'Point', coordinates: [40.724, -73.997] },
+ *       distanceField: "dist.calculated", // required
+ *       maxDistance: 0.008,
+ *       query: { type: "public" },
+ *       includeLocs: "dist.location",
+ *       spherical: true,
+ *     });
+ *
+ * @see $geoNear https://www.mongodb.com/docs/manual/reference/aggregation/geoNear/
+ * @method near
+ * @memberOf Aggregate
+ * @instance
+ * @param {Object} arg
+ * @return {Aggregate}
+ * @api public
+ */
+
+Aggregate.prototype.near = function(arg) {
+  const op = {};
+  op.$geoNear = arg;
+  return this.append(op);
+};
+
+/*!
+ * define methods
+ */
+
+'group match skip limit out densify fill'.split(' ').forEach(function($operator) {
+  Aggregate.prototype[$operator] = function(arg) {
+    const op = {};
+    op['$' + $operator] = arg;
+    return this.append(op);
+  };
+});
+
+/**
+ * Appends new custom $unwind operator(s) to this aggregate pipeline.
+ *
+ * Note that the `$unwind` operator requires the path name to start with '$'.
+ * Mongoose will prepend '$' if the specified field doesn't start '$'.
+ *
+ * #### Example:
+ *
+ *     aggregate.unwind("tags");
+ *     aggregate.unwind("a", "b", "c");
+ *     aggregate.unwind({ path: '$tags', preserveNullAndEmptyArrays: true });
+ *
+ * @see $unwind https://www.mongodb.com/docs/manual/reference/aggregation/unwind/
+ * @param {String|Object|String[]|Object[]} fields the field(s) to unwind, either as field names or as [objects with options](https://www.mongodb.com/docs/manual/reference/operator/aggregation/unwind/#document-operand-with-options). If passing a string, prefixing the field name with '$' is optional. If passing an object, `path` must start with '$'.
+ * @return {Aggregate}
+ * @api public
+ */
+
+Aggregate.prototype.unwind = function() {
+  const args = [...arguments];
+
+  const res = [];
+  for (const arg of args) {
+    if (arg &amp;&amp; typeof arg === 'object') {
+      res.push({ $unwind: arg });
+    } else if (typeof arg === 'string') {
+      res.push({
+        $unwind: (arg[0] === '$') ? arg : '$' + arg
+      });
+    } else {
+      throw new Error('Invalid arg "' + arg + '" to unwind(), ' +
+        'must be string or object');
+    }
+  }
+
+  return this.append.apply(this, res);
+};
+
+/**
+ * Appends a new $replaceRoot operator to this aggregate pipeline.
+ *
+ * Note that the `$replaceRoot` operator requires field strings to start with '$'.
+ * If you are passing in a string Mongoose will prepend '$' if the specified field doesn't start '$'.
+ * If you are passing in an object the strings in your expression will not be altered.
+ *
+ * #### Example:
+ *
+ *     aggregate.replaceRoot("user");
+ *
+ *     aggregate.replaceRoot({ x: { $concat: ['$this', '$that'] } });
+ *
+ * @see $replaceRoot https://www.mongodb.com/docs/manual/reference/operator/aggregation/replaceRoot
+ * @param {String|Object} newRoot the field or document which will become the new root document
+ * @return {Aggregate}
+ * @api public
+ */
+
+Aggregate.prototype.replaceRoot = function(newRoot) {
+  let ret;
+
+  if (typeof newRoot === 'string') {
+    ret = newRoot.startsWith('$') ? newRoot : '$' + newRoot;
+  } else {
+    ret = newRoot;
+  }
+
+  return this.append({
+    $replaceRoot: {
+      newRoot: ret
+    }
+  });
+};
+
+/**
+ * Appends a new $count operator to this aggregate pipeline.
+ *
+ * #### Example:
+ *
+ *     aggregate.count("userCount");
+ *
+ * @see $count https://www.mongodb.com/docs/manual/reference/operator/aggregation/count
+ * @param {String} fieldName The name of the output field which has the count as its value. It must be a non-empty string, must not start with $ and must not contain the . character.
+ * @return {Aggregate}
+ * @api public
+ */
+
+Aggregate.prototype.count = function(fieldName) {
+  return this.append({ $count: fieldName });
+};
+
+/**
+ * Appends a new $sortByCount operator to this aggregate pipeline. Accepts either a string field name
+ * or a pipeline object.
+ *
+ * Note that the `$sortByCount` operator requires the new root to start with '$'.
+ * Mongoose will prepend '$' if the specified field name doesn't start with '$'.
+ *
+ * #### Example:
+ *
+ *     aggregate.sortByCount('users');
+ *     aggregate.sortByCount({ $mergeObjects: [ "$employee", "$business" ] })
+ *
+ * @see $sortByCount https://www.mongodb.com/docs/manual/reference/operator/aggregation/sortByCount/
+ * @param {Object|String} arg
+ * @return {Aggregate} this
+ * @api public
+ */
+
+Aggregate.prototype.sortByCount = function(arg) {
+  if (arg &amp;&amp; typeof arg === 'object') {
+    return this.append({ $sortByCount: arg });
+  } else if (typeof arg === 'string') {
+    return this.append({
+      $sortByCount: (arg[0] === '$') ? arg : '$' + arg
+    });
+  } else {
+    throw new TypeError('Invalid arg "' + arg + '" to sortByCount(), ' +
+      'must be string or object');
+  }
+};
+
+/**
+ * Appends new custom $lookup operator to this aggregate pipeline.
+ *
+ * #### Example:
+ *
+ *     aggregate.lookup({ from: 'users', localField: 'userId', foreignField: '_id', as: 'users' });
+ *
+ * @see $lookup https://www.mongodb.com/docs/manual/reference/operator/aggregation/lookup/#pipe._S_lookup
+ * @param {Object} options to $lookup as described in the above link
+ * @return {Aggregate}
+ * @api public
+ */
+
+Aggregate.prototype.lookup = function(options) {
+  return this.append({ $lookup: options });
+};
+
+/**
+ * Appends new custom $graphLookup operator(s) to this aggregate pipeline, performing a recursive search on a collection.
+ *
+ * Note that graphLookup can only consume at most 100MB of memory, and does not allow disk use even if `{ allowDiskUse: true }` is specified.
+ *
+ * #### Example:
+ *
+ *      // Suppose we have a collection of courses, where a document might look like `{ _id: 0, name: 'Calculus', prerequisite: 'Trigonometry'}` and `{ _id: 0, name: 'Trigonometry', prerequisite: 'Algebra' }`
+ *      aggregate.graphLookup({ from: 'courses', startWith: '$prerequisite', connectFromField: 'prerequisite', connectToField: 'name', as: 'prerequisites', maxDepth: 3 }) // this will recursively search the 'courses' collection up to 3 prerequisites
+ *
+ * @see $graphLookup https://www.mongodb.com/docs/manual/reference/operator/aggregation/graphLookup/#pipe._S_graphLookup
+ * @param {Object} options to $graphLookup as described in the above link
+ * @return {Aggregate}
+ * @api public
+ */
+
+Aggregate.prototype.graphLookup = function(options) {
+  const cloneOptions = {};
+  if (options) {
+    if (!utils.isObject(options)) {
+      throw new TypeError('Invalid graphLookup() argument. Must be an object.');
+    }
+
+    utils.mergeClone(cloneOptions, options);
+    const startWith = cloneOptions.startWith;
+
+    if (startWith &amp;&amp; typeof startWith === 'string') {
+      cloneOptions.startWith = cloneOptions.startWith.startsWith('$') ?
+        cloneOptions.startWith :
+        '$' + cloneOptions.startWith;
+    }
+
+  }
+  return this.append({ $graphLookup: cloneOptions });
+};
+
+/**
+ * Appends new custom $sample operator to this aggregate pipeline.
+ *
+ * #### Example:
+ *
+ *     aggregate.sample(3); // Add a pipeline that picks 3 random documents
+ *
+ * @see $sample https://www.mongodb.com/docs/manual/reference/operator/aggregation/sample/#pipe._S_sample
+ * @param {Number} size number of random documents to pick
+ * @return {Aggregate}
+ * @api public
+ */
+
+Aggregate.prototype.sample = function(size) {
+  return this.append({ $sample: { size: size } });
+};
+
+/**
+ * Appends a new $sort operator to this aggregate pipeline.
+ *
+ * If an object is passed, values allowed are `asc`, `desc`, `ascending`, `descending`, `1`, and `-1`.
+ *
+ * If a string is passed, it must be a space delimited list of path names. The sort order of each path is ascending unless the path name is prefixed with `-` which will be treated as descending.
+ *
+ * #### Example:
+ *
+ *     // these are equivalent
+ *     aggregate.sort({ field: 'asc', test: -1 });
+ *     aggregate.sort('field -test');
+ *
+ * @see $sort https://www.mongodb.com/docs/manual/reference/aggregation/sort/
+ * @param {Object|String} arg
+ * @return {Aggregate} this
+ * @api public
+ */
+
+Aggregate.prototype.sort = function(arg) {
+  // TODO refactor to reuse the query builder logic
+
+  const sort = {};
+
+  if (getConstructorName(arg) === 'Object') {
+    const desc = ['desc', 'descending', -1];
+    Object.keys(arg).forEach(function(field) {
+      // If sorting by text score, skip coercing into 1/-1
+      if (arg[field] instanceof Object &amp;&amp; arg[field].$meta) {
+        sort[field] = arg[field];
+        return;
+      }
+      sort[field] = desc.indexOf(arg[field]) === -1 ? 1 : -1;
+    });
+  } else if (arguments.length === 1 &amp;&amp; typeof arg === 'string') {
+    arg.split(/\s+/).forEach(function(field) {
+      if (!field) {
+        return;
+      }
+      const ascend = field[0] === '-' ? -1 : 1;
+      if (ascend === -1) {
+        field = field.substring(1);
+      }
+      sort[field] = ascend;
+    });
+  } else {
+    throw new TypeError('Invalid sort() argument. Must be a string or object.');
+  }
+
+  return this.append({ $sort: sort });
+};
+
+/**
+ * Appends new $unionWith operator to this aggregate pipeline.
+ *
+ * #### Example:
+ *
+ *     aggregate.unionWith({ coll: 'users', pipeline: [ { $match: { _id: 1 } } ] });
+ *
+ * @see $unionWith https://www.mongodb.com/docs/manual/reference/operator/aggregation/unionWith
+ * @param {Object} options to $unionWith query as described in the above link
+ * @return {Aggregate}
+ * @api public
+ */
+
+Aggregate.prototype.unionWith = function(options) {
+  return this.append({ $unionWith: options });
+};
+
+
+/**
+ * Sets the readPreference option for the aggregation query.
+ *
+ * #### Example:
+ *
+ *     await Model.aggregate(pipeline).read('primaryPreferred');
+ *
+ * @param {String|ReadPreference} pref one of the listed preference options or their aliases
+ * @param {Array} [tags] optional tags for this query.
+ * @return {Aggregate} this
+ * @api public
+ * @see mongodb https://www.mongodb.com/docs/manual/applications/replication/#read-preference
+ */
+
+Aggregate.prototype.read = function(pref, tags) {
+  read.call(this, pref, tags);
+  return this;
+};
+
+/**
+ * Sets the readConcern level for the aggregation query.
+ *
+ * #### Example:
+ *
+ *     await Model.aggregate(pipeline).readConcern('majority');
+ *
+ * @param {String} level one of the listed read concern level or their aliases
+ * @see mongodb https://www.mongodb.com/docs/manual/reference/read-concern/
+ * @return {Aggregate} this
+ * @api public
+ */
+
+Aggregate.prototype.readConcern = function(level) {
+  readConcern.call(this, level);
+  return this;
+};
+
+/**
+ * Appends a new $redact operator to this aggregate pipeline.
+ *
+ * If 3 arguments are supplied, Mongoose will wrap them with if-then-else of $cond operator respectively
+ * If `thenExpr` or `elseExpr` is string, make sure it starts with $$, like `$$DESCEND`, `$$PRUNE` or `$$KEEP`.
+ *
+ * #### Example:
+ *
+ *     await Model.aggregate(pipeline).redact({
+ *       $cond: {
+ *         if: { $eq: [ '$level', 5 ] },
+ *         then: '$$PRUNE',
+ *         else: '$$DESCEND'
+ *       }
+ *     });
+ *
+ *     // $redact often comes with $cond operator, you can also use the following syntax provided by mongoose
+ *     await Model.aggregate(pipeline).redact({ $eq: [ '$level', 5 ] }, '$$PRUNE', '$$DESCEND');
+ *
+ * @param {Object} expression redact options or conditional expression
+ * @param {String|Object} [thenExpr] true case for the condition
+ * @param {String|Object} [elseExpr] false case for the condition
+ * @return {Aggregate} this
+ * @see $redact https://www.mongodb.com/docs/manual/reference/operator/aggregation/redact/
+ * @api public
+ */
+
+Aggregate.prototype.redact = function(expression, thenExpr, elseExpr) {
+  if (arguments.length === 3) {
+    if ((typeof thenExpr === 'string' &amp;&amp; !validRedactStringValues.has(thenExpr)) ||
+      (typeof elseExpr === 'string' &amp;&amp; !validRedactStringValues.has(elseExpr))) {
+      throw new Error('If thenExpr or elseExpr is string, it must be either $$DESCEND, $$PRUNE or $$KEEP');
+    }
+
+    expression = {
+      $cond: {
+        if: expression,
+        then: thenExpr,
+        else: elseExpr
+      }
+    };
+  } else if (arguments.length !== 1) {
+    throw new TypeError('Invalid arguments');
+  }
+
+  return this.append({ $redact: expression });
+};
+
+/**
+ * Execute the aggregation with explain
+ *
+ * #### Example:
+ *
+ *     Model.aggregate(..).explain()
+ *
+ * @param {String} [verbosity]
+ * @return {Promise}
+ */
+
+Aggregate.prototype.explain = async function explain(verbosity) {
+  if (typeof verbosity === 'function' || typeof arguments[1] === 'function') {
+    throw new MongooseError('Aggregate.prototype.explain() no longer accepts a callback');
+  }
+  const model = this._model;
+
+  if (!this._pipeline.length) {
+    throw new Error('Aggregate has empty pipeline');
+  }
+
+  prepareDiscriminatorPipeline(this._pipeline, this._model.schema);
+
+  await new Promise((resolve, reject) => {
+    model.hooks.execPre('aggregate', this, error => {
+      if (error) {
+        const _opts = { error: error };
+        return model.hooks.execPost('aggregate', this, [null], _opts, error => {
+          reject(error);
+        });
+      } else {
+        resolve();
+      }
+    });
+  });
+
+  const cursor = model.collection.aggregate(this._pipeline, this.options);
+
+  if (verbosity == null) {
+    verbosity = true;
+  }
+
+  let result = null;
+  try {
+    result = await cursor.explain(verbosity);
+  } catch (error) {
+    await new Promise((resolve, reject) => {
+      const _opts = { error: error };
+      model.hooks.execPost('aggregate', this, [null], _opts, error => {
+        if (error) {
+          return reject(error);
+        }
+        return resolve();
+      });
+    });
+  }
+
+  const _opts = { error: null };
+  await new Promise((resolve, reject) => {
+    model.hooks.execPost('aggregate', this, [result], _opts, error => {
+      if (error) {
+        return reject(error);
+      }
+      return resolve();
+    });
+  });
+
+  return result;
+};
+
+/**
+ * Sets the allowDiskUse option for the aggregation query
+ *
+ * #### Example:
+ *
+ *     await Model.aggregate([{ $match: { foo: 'bar' } }]).allowDiskUse(true);
+ *
+ * @param {Boolean} value Should tell server it can use hard drive to store data during aggregation.
+ * @return {Aggregate} this
+ * @see mongodb https://www.mongodb.com/docs/manual/reference/command/aggregate/
+ */
+
+Aggregate.prototype.allowDiskUse = function(value) {
+  this.options.allowDiskUse = value;
+  return this;
+};
+
+/**
+ * Sets the hint option for the aggregation query
+ *
+ * #### Example:
+ *
+ *     Model.aggregate(..).hint({ qty: 1, category: 1 }).exec();
+ *
+ * @param {Object|String} value a hint object or the index name
+ * @return {Aggregate} this
+ * @see mongodb https://www.mongodb.com/docs/manual/reference/command/aggregate/
+ */
+
+Aggregate.prototype.hint = function(value) {
+  this.options.hint = value;
+  return this;
+};
+
+/**
+ * Sets the session for this aggregation. Useful for [transactions](https://mongoosejs.com/docs/transactions.html).
+ *
+ * #### Example:
+ *
+ *     const session = await Model.startSession();
+ *     await Model.aggregate(..).session(session);
+ *
+ * @param {ClientSession} session
+ * @return {Aggregate} this
+ * @see mongodb https://www.mongodb.com/docs/manual/reference/command/aggregate/
+ */
+
+Aggregate.prototype.session = function(session) {
+  if (session == null) {
+    delete this.options.session;
+  } else {
+    this.options.session = session;
+  }
+  return this;
+};
+
+/**
+ * Lets you set arbitrary options, for middleware or plugins.
+ *
+ * #### Example:
+ *
+ *     const agg = Model.aggregate(..).option({ allowDiskUse: true }); // Set the `allowDiskUse` option
+ *     agg.options; // `{ allowDiskUse: true }`
+ *
+ * @param {Object} options keys to merge into current options
+ * @param {Number} [options.maxTimeMS] number limits the time this aggregation will run, see [MongoDB docs on `maxTimeMS`](https://www.mongodb.com/docs/manual/reference/operator/meta/maxTimeMS/)
+ * @param {Boolean} [options.allowDiskUse] boolean if true, the MongoDB server will use the hard drive to store data during this aggregation
+ * @param {Object} [options.collation] object see [`Aggregate.prototype.collation()`](https://mongoosejs.com/docs/api/aggregate.html#Aggregate.prototype.collation())
+ * @param {ClientSession} [options.session] ClientSession see [`Aggregate.prototype.session()`](https://mongoosejs.com/docs/api/aggregate.html#Aggregate.prototype.session())
+ * @see mongodb https://www.mongodb.com/docs/manual/reference/command/aggregate/
+ * @return {Aggregate} this
+ * @api public
+ */
+
+Aggregate.prototype.option = function(value) {
+  for (const key in value) {
+    this.options[key] = value[key];
+  }
+  return this;
+};
+
+/**
+ * Sets the `cursor` option and executes this aggregation, returning an aggregation cursor.
+ * Cursors are useful if you want to process the results of the aggregation one-at-a-time
+ * because the aggregation result is too big to fit into memory.
+ *
+ * #### Example:
+ *
+ *     const cursor = Model.aggregate(..).cursor({ batchSize: 1000 });
+ *     cursor.eachAsync(function(doc, i) {
+ *       // use doc
+ *     });
+ *
+ * @param {Object} options
+ * @param {Number} [options.batchSize] set the cursor batch size
+ * @param {Boolean} [options.useMongooseAggCursor] use experimental mongoose-specific aggregation cursor (for `eachAsync()` and other query cursor semantics)
+ * @return {AggregationCursor} cursor representing this aggregation
+ * @api public
+ * @see mongodb https://mongodb.github.io/node-mongodb-native/4.9/classes/AggregationCursor.html
+ */
+
+Aggregate.prototype.cursor = function(options) {
+  this.options.cursor = options || {};
+  return new AggregationCursor(this); // return this;
+};
+
+/**
+ * Adds a collation
+ *
+ * #### Example:
+ *
+ *     const res = await Model.aggregate(pipeline).collation({ locale: 'en_US', strength: 1 });
+ *
+ * @param {Object} collation options
+ * @return {Aggregate} this
+ * @api public
+ * @see mongodb https://mongodb.github.io/node-mongodb-native/4.9/interfaces/CollationOptions.html
+ */
+
+Aggregate.prototype.collation = function(collation) {
+  this.options.collation = collation;
+  return this;
+};
+
+/**
+ * Combines multiple aggregation pipelines.
+ *
+ * #### Example:
+ *
+ *     const res = await Model.aggregate().facet({
+ *       books: [{ groupBy: '$author' }],
+ *       price: [{ $bucketAuto: { groupBy: '$price', buckets: 2 } }]
+ *     });
+ *
+ *     // Output: { books: [...], price: [{...}, {...}] }
+ *
+ * @param {Object} facet options
+ * @return {Aggregate} this
+ * @see $facet https://www.mongodb.com/docs/manual/reference/operator/aggregation/facet/
+ * @api public
+ */
+
+Aggregate.prototype.facet = function(options) {
+  return this.append({ $facet: options });
+};
+
+/**
+ * Helper for [Atlas Text Search](https://www.mongodb.com/docs/atlas/atlas-search/tutorial/)'s
+ * `$search` stage.
+ *
+ * #### Example:
+ *
+ *     const res = await Model.aggregate().
+ *      search({
+ *        text: {
+ *          query: 'baseball',
+ *          path: 'plot'
+ *        }
+ *      });
+ *
+ *     // Output: [{ plot: '...', title: '...' }]
+ *
+ * @param {Object} $search options
+ * @return {Aggregate} this
+ * @see $search https://www.mongodb.com/docs/atlas/atlas-search/tutorial/
+ * @api public
+ */
+
+Aggregate.prototype.search = function(options) {
+  return this.append({ $search: options });
+};
+
+/**
+ * Returns the current pipeline
+ *
+ * #### Example:
+ *
+ *     MyModel.aggregate().match({ test: 1 }).pipeline(); // [{ $match: { test: 1 } }]
+ *
+ * @return {Array} The current pipeline similar to the operation that will be executed
+ * @api public
+ */
+
+Aggregate.prototype.pipeline = function() {
+  return this._pipeline;
+};
+
+/**
+ * Executes the aggregate pipeline on the currently bound Model.
+ *
+ * #### Example:
+ *     const result = await aggregate.exec();
+ *
+ * @return {Promise}
+ * @api public
+ */
+
+Aggregate.prototype.exec = async function exec() {
+  if (!this._model) {
+    throw new Error('Aggregate not bound to any Model');
+  }
+  if (typeof arguments[0] === 'function') {
+    throw new MongooseError('Aggregate.prototype.exec() no longer accepts a callback');
+  }
+  const model = this._model;
+  const collection = this._model.collection;
+
+  applyGlobalMaxTimeMS(this.options, model);
+  applyGlobalDiskUse(this.options, model);
+
+  if (this.options &amp;&amp; this.options.cursor) {
+    return new AggregationCursor(this);
+  }
+
+  prepareDiscriminatorPipeline(this._pipeline, this._model.schema);
+  stringifyFunctionOperators(this._pipeline);
+
+  await new Promise((resolve, reject) => {
+    model.hooks.execPre('aggregate', this, error => {
+      if (error) {
+        const _opts = { error: error };
+        return model.hooks.execPost('aggregate', this, [null], _opts, error => {
+          reject(error);
+        });
+      } else {
+        resolve();
+      }
+    });
+  });
+
+  if (!this._pipeline.length) {
+    throw new MongooseError('Aggregate has empty pipeline');
+  }
+
+  const options = clone(this.options || {});
+  let result;
+  try {
+    const cursor = await collection.aggregate(this._pipeline, options);
+    result = await cursor.toArray();
+  } catch (error) {
+    await new Promise((resolve, reject) => {
+      const _opts = { error: error };
+      model.hooks.execPost('aggregate', this, [null], _opts, (error) => {
+        if (error) {
+          return reject(error);
+        }
+
+        resolve();
+      });
+    });
+  }
+
+  const _opts = { error: null };
+  await new Promise((resolve, reject) => {
+    model.hooks.execPost('aggregate', this, [result], _opts, error => {
+      if (error) {
+        return reject(error);
+      }
+      return resolve();
+    });
+  });
+
+  return result;
+};
+
+/**
+ * Provides a Promise-like `then` function, which will call `.exec` without a callback
+ * Compatible with `await`.
+ *
+ * #### Example:
+ *
+ *     Model.aggregate(..).then(successCallback, errorCallback);
+ *
+ * @param {Function} [resolve] successCallback
+ * @param {Function} [reject]  errorCallback
+ * @return {Promise}
+ */
+Aggregate.prototype.then = function(resolve, reject) {
+  return this.exec().then(resolve, reject);
+};
+
+/**
+ * Executes the aggregation returning a `Promise` which will be
+ * resolved with either the doc(s) or rejected with the error.
+ * Like [`.then()`](https://mongoosejs.com/docs/api/query.html#Query.prototype.then), but only takes a rejection handler.
+ * Compatible with `await`.
+ *
+ * @param {Function} [reject]
+ * @return {Promise}
+ * @api public
+ */
+
+Aggregate.prototype.catch = function(reject) {
+  return this.exec().then(null, reject);
+};
+
+/**
+ * Executes the aggregate returning a `Promise` which will be
+ * resolved with `.finally()` chained.
+ *
+ * More about [Promise `finally()` in JavaScript](https://thecodebarbarian.com/using-promise-finally-in-node-js.html).
+ *
+ * @param {Function} [onFinally]
+ * @return {Promise}
+ * @api public
+ */
+
+Aggregate.prototype.finally = function(onFinally) {
+  return this.exec().finally(onFinally);
+};
+
+/**
+ * Returns an asyncIterator for use with [`for/await/of` loops](https://thecodebarbarian.com/getting-started-with-async-iterators-in-node-js)
+ * You do not need to call this function explicitly, the JavaScript runtime
+ * will call it for you.
+ *
+ * #### Example:
+ *
+ *     const agg = Model.aggregate([{ $match: { age: { $gte: 25 } } }]);
+ *     for await (const doc of agg) {
+ *       console.log(doc.name);
+ *     }
+ *
+ * Node.js 10.x supports async iterators natively without any flags. You can
+ * enable async iterators in Node.js 8.x using the [`--harmony_async_iteration` flag](https://github.com/tc39/proposal-async-iteration/issues/117#issuecomment-346695187).
+ *
+ * **Note:** This function is not set if `Symbol.asyncIterator` is undefined. If
+ * `Symbol.asyncIterator` is undefined, that means your Node.js version does not
+ * support async iterators.
+ *
+ * @method [Symbol.asyncIterator]
+ * @memberOf Aggregate
+ * @instance
+ * @api public
+ */
+
+if (Symbol.asyncIterator != null) {
+  Aggregate.prototype[Symbol.asyncIterator] = function() {
+    return this.cursor({ useMongooseAggCursor: true }).transformNull()._transformForAsyncIterator();
+  };
+}
+
+/*!
+ * Helpers
+ */
+
+/**
+ * Checks whether an object is likely a pipeline operator
+ *
+ * @param {Object} obj object to check
+ * @return {Boolean}
+ * @api private
+ */
+
+function isOperator(obj) {
+  if (typeof obj !== 'object' || obj === null) {
+    return false;
+  }
+
+  const k = Object.keys(obj);
+
+  return k.length === 1 &amp;&amp; k[0][0] === '$';
+}
+
+/**
+ * Adds the appropriate `$match` pipeline step to the top of an aggregate's
+ * pipeline, should it's model is a non-root discriminator type. This is
+ * analogous to the `prepareDiscriminatorCriteria` function in `lib/query.js`.
+ *
+ * @param {Aggregate} aggregate Aggregate to prepare
+ * @api private
+ */
+
+Aggregate._prepareDiscriminatorPipeline = prepareDiscriminatorPipeline;
+
+/*!
+ * Exports
+ */
+
+module.exports = Aggregate;
+</code></pre>
+        </article>
+    </section>
+
+
+
+
+</div>
+
+<nav>
+    <h2><a href="index.html">Home</a></h2><h3>Classes</h3><ul><li><a href="AbstractCursor.html">AbstractCursor</a></li><li><a href="AbstractOperation.html">AbstractOperation</a></li><li><a href="Admin.html">Admin</a></li><li><a href="Agent.html">Agent</a></li><li><a href="AggregateOperation.html">AggregateOperation</a></li><li><a href="AggregationCursor.html">AggregationCursor</a></li><li><a href="AuthContext.html">AuthContext</a></li><li><a href="AuthenticationError.html">AuthenticationError</a></li><li><a href="Authenticator.html">Authenticator</a></li><li><a href="AutoEncrypter.html">AutoEncrypter</a></li><li><a href="AwsServiceWorkflow.html">AwsServiceWorkflow</a></li><li><a href="AzureCredentialCache.html">AzureCredentialCache</a></li><li><a href="AzureServiceWorkflow.html">AzureServiceWorkflow</a></li><li><a href="AzureTokenCache.html">AzureTokenCache</a></li><li><a href="AzureTokenEntry.html">AzureTokenEntry</a></li><li><a href="Batch.html">Batch</a></li><li><a href="BufferPool.html">BufferPool</a></li><li><a href="BulkOperationBase.html">BulkOperationBase</a></li><li><a href="BulkWriteOperation.html">BulkWriteOperation</a></li><li><a href="BulkWriteResult.html">BulkWriteResult</a></li><li><a href="BulkWriteShimOperation.html">BulkWriteShimOperation</a></li><li><a href="Cache.html">Cache</a></li><li><a href="CallbackLockCache.html">CallbackLockCache</a></li><li><a href="CallbackWorkflow.html">CallbackWorkflow</a></li><li><a href="CancellationToken.html">CancellationToken</a></li><li><a href="global.html#CastError">CastError</a></li><li><a href="ChangeStream.html">ChangeStream</a></li><li><a href="ChangeStreamCursor.html">ChangeStreamCursor</a></li><li><a href="ClientEncryption.html">ClientEncryption</a></li><li><a href="ClientSession.html">ClientSession</a></li><li><a href="global.html#Collection">Collection</a></li><li><a href="CollectionsOperation.html">CollectionsOperation</a></li><li><a href="CommandFailedEvent.html">CommandFailedEvent</a></li><li><a href="CommandOperation.html">CommandOperation</a></li><li><a href="CommandStartedEvent.html">CommandStartedEvent</a></li><li><a href="CommandSucceededEvent.html">CommandSucceededEvent</a></li><li><a href="Connection.html">Connection</a></li><li><a href="ConnectionCheckOutFailedEvent.html">ConnectionCheckOutFailedEvent</a></li><li><a href="ConnectionCheckOutStartedEvent.html">ConnectionCheckOutStartedEvent</a></li><li><a href="ConnectionCheckedInEvent.html">ConnectionCheckedInEvent</a></li><li><a href="ConnectionCheckedOutEvent.html">ConnectionCheckedOutEvent</a></li><li><a href="ConnectionClosedEvent.html">ConnectionClosedEvent</a></li><li><a href="ConnectionCreatedEvent.html">ConnectionCreatedEvent</a></li><li><a href="ConnectionPool.html">ConnectionPool</a></li><li><a href="ConnectionPoolClearedEvent.html">ConnectionPoolClearedEvent</a></li><li><a href="ConnectionPoolClosedEvent.html">ConnectionPoolClosedEvent</a></li><li><a href="ConnectionPoolCreatedEvent.html">ConnectionPoolCreatedEvent</a></li><li><a href="ConnectionPoolMetrics.html">ConnectionPoolMetrics</a></li><li><a href="ConnectionPoolMonitoringEvent.html">ConnectionPoolMonitoringEvent</a></li><li><a href="ConnectionPoolReadyEvent.html">ConnectionPoolReadyEvent</a></li><li><a href="ConnectionReadyEvent.html">ConnectionReadyEvent</a></li><li><a href="ContentDisposition.html">ContentDisposition</a></li><li><a href="CountDocumentsOperation.html">CountDocumentsOperation</a></li><li><a href="CountOperation.html">CountOperation</a></li><li><a href="CreateCollectionOperation.html">CreateCollectionOperation</a></li><li><a href="CreateCollectionsError.html">CreateCollectionsError</a></li><li><a href="CreateIndexOperation.html">CreateIndexOperation</a></li><li><a href="CreateIndexesOperation.html">CreateIndexesOperation</a></li><li><a href="CreateSearchIndexesOperation.html">CreateSearchIndexesOperation</a></li><li><a href="CryptoConnection.html">CryptoConnection</a></li><li><a href="Db.html">Db</a></li><li><a href="DbStatsOperation.html">DbStatsOperation</a></li><li><a href="Decimal128.html">Decimal128</a></li><li><a href="DeleteOperation.html">DeleteOperation</a></li><li><a href="DistinctOperation.html">DistinctOperation</a></li><li><a href="DivergentArrayError.html">DivergentArrayError</a></li><li><a href="DocumentNotFoundError.html">DocumentNotFoundError</a></li><li><a href="DropCollectionOperation.html">DropCollectionOperation</a></li><li><a href="DropDatabaseOperation.html">DropDatabaseOperation</a></li><li><a href="DropIndexOperation.html">DropIndexOperation</a></li><li><a href="DropSearchIndexOperation.html">DropSearchIndexOperation</a></li><li><a href="EachAsyncMultiError.html">EachAsyncMultiError</a></li><li><a href="Encrypter.html">Encrypter</a></li><li><a href="EnsureIndexOperation.html">EnsureIndexOperation</a></li><li><a href="global.html#Error">Error</a></li><li><a href="EstimatedDocumentCountOperation.html">EstimatedDocumentCountOperation</a></li><li><a href="ExpiringCacheEntry.html">ExpiringCacheEntry</a></li><li><a href="Explain.html">Explain</a></li><li><a href="FindAndModifyOperation.html">FindAndModifyOperation</a></li><li><a href="FindCursor.html">FindCursor</a></li><li><a href="FindOneAndDeleteOperation.html">FindOneAndDeleteOperation</a></li><li><a href="FindOneAndReplaceOperation.html">FindOneAndReplaceOperation</a></li><li><a href="FindOneAndUpdateOperation.html">FindOneAndUpdateOperation</a></li><li><a href="FindOperation.html">FindOperation</a></li><li><a href="FindOperators.html">FindOperators</a></li><li><a href="GetMoreOperation.html">GetMoreOperation</a></li><li><a href="GridFSBucket.html">GridFSBucket</a></li><li><a href="GridFSBucketReadStream.html">GridFSBucketReadStream</a></li><li><a href="GridFSBucketWriteStream.html">GridFSBucketWriteStream</a></li><li><a href="Headers.html">Headers</a></li><li><a href="HostAddress.html">HostAddress</a></li><li><a href="HttpsProxyAgent.html">HttpsProxyAgent</a></li><li><a href="IndexExistsOperation.html">IndexExistsOperation</a></li><li><a href="IndexInformationOperation.html">IndexInformationOperation</a></li><li><a href="IndexesOperation.html">IndexesOperation</a></li><li><a href="InsertManyOperation.html">InsertManyOperation</a></li><li><a href="InsertOperation.html">InsertOperation</a></li><li><a href="InvalidSchemaOptionError.html">InvalidSchemaOptionError</a></li><li><a href="IsCappedOperation.html">IsCappedOperation</a></li><li><a href="LimitedSizeDocument.html">LimitedSizeDocument</a></li><li><a href="List.html">List</a></li><li><a href="ListCollectionsCursor.html">ListCollectionsCursor</a></li><li><a href="ListCollectionsOperation.html">ListCollectionsOperation</a></li><li><a href="ListDatabasesOperation.html">ListDatabasesOperation</a></li><li><a href="ListIndexesCursor.html">ListIndexesCursor</a></li><li><a href="ListIndexesOperation.html">ListIndexesOperation</a></li><li><a href="ListSearchIndexesCursor.html">ListSearchIndexesCursor</a></li><li><a href="MessageStream.html">MessageStream</a></li><li><a href="MissingSchemaError.html">MissingSchemaError</a></li><li><a href="ModernConnection.html">ModernConnection</a></li><li><a href="MongoAPIError.html">MongoAPIError</a></li><li><a href="MongoAWSError.html">MongoAWSError</a></li><li><a href="MongoAzureError.html">MongoAzureError</a></li><li><a href="MongoBatchReExecutionError.html">MongoBatchReExecutionError</a></li><li><a href="MongoBulkWriteError.html">MongoBulkWriteError</a></li><li><a href="MongoChangeStreamError.html">MongoChangeStreamError</a></li><li><a href="MongoClient.html">MongoClient</a></li><li><a href="MongoCompatibilityError.html">MongoCompatibilityError</a></li><li><a href="MongoCredentials.html">MongoCredentials</a></li><li><a href="MongoCryptAzureKMSRequestError.html">MongoCryptAzureKMSRequestError</a></li><li><a href="MongoCryptCreateDataKeyError.html">MongoCryptCreateDataKeyError</a></li><li><a href="MongoCryptCreateEncryptedCollectionError.html">MongoCryptCreateEncryptedCollectionError</a></li><li><a href="MongoCryptError.html">MongoCryptError</a></li><li><a href="MongoCryptInvalidArgumentError.html">MongoCryptInvalidArgumentError</a></li><li><a href="MongoCryptKMSRequestNetworkTimeoutError.html">MongoCryptKMSRequestNetworkTimeoutError</a></li><li><a href="MongoCursorExhaustedError.html">MongoCursorExhaustedError</a></li><li><a href="MongoCursorInUseError.html">MongoCursorInUseError</a></li><li><a href="MongoDBCollectionNamespace.html">MongoDBCollectionNamespace</a></li><li><a href="MongoDBNamespace.html">MongoDBNamespace</a></li><li><a href="MongoDBOIDC.html">MongoDBOIDC</a></li><li><a href="MongoDecompressionError.html">MongoDecompressionError</a></li><li><a href="MongoDriverError.html">MongoDriverError</a></li><li><a href="MongoError.html">MongoError</a></li><li><a href="MongoExpiredSessionError.html">MongoExpiredSessionError</a></li><li><a href="MongoGridFSChunkError.html">MongoGridFSChunkError</a></li><li><a href="MongoGridFSStreamError.html">MongoGridFSStreamError</a></li><li><a href="MongoInvalidArgumentError.html">MongoInvalidArgumentError</a></li><li><a href="MongoKerberosError.html">MongoKerberosError</a></li><li><a href="MongoLogger.html">MongoLogger</a></li><li><a href="MongoMissingCredentialsError.html">MongoMissingCredentialsError</a></li><li><a href="MongoMissingDependencyError.html">MongoMissingDependencyError</a></li><li><a href="MongoNetworkError.html">MongoNetworkError</a></li><li><a href="MongoNetworkTimeoutError.html">MongoNetworkTimeoutError</a></li><li><a href="MongoNotConnectedError.html">MongoNotConnectedError</a></li><li><a href="MongoParseError.html">MongoParseError</a></li><li><a href="MongoRuntimeError.html">MongoRuntimeError</a></li><li><a href="MongoServerClosedError.html">MongoServerClosedError</a></li><li><a href="MongoServerError.html">MongoServerError</a></li><li><a href="MongoServerSelectionError.html">MongoServerSelectionError</a></li><li><a href="MongoSystemError.html">MongoSystemError</a></li><li><a href="MongoTailableCursorError.html">MongoTailableCursorError</a></li><li><a href="MongoTopologyClosedError.html">MongoTopologyClosedError</a></li><li><a href="MongoTransactionError.html">MongoTransactionError</a></li><li><a href="MongoUnexpectedServerResponseError.html">MongoUnexpectedServerResponseError</a></li><li><a href="MongoWriteConcernError.html">MongoWriteConcernError</a></li><li><a href="MongocryptdManager.html">MongocryptdManager</a></li><li><a href="MongooseBulkWriteError.html">MongooseBulkWriteError</a></li><li><a href="Monitor.html">Monitor</a></li><li><a href="MonitorInterval.html">MonitorInterval</a></li><li><a href="ObjectExpectedError.html">ObjectExpectedError</a></li><li><a href="ObjectId.html">ObjectId</a></li><li><a href="ObjectParameterError.html">ObjectParameterError</a></li><li><a href="OpCompressedRequest.html">OpCompressedRequest</a></li><li><a href="OpMsgRequest.html">OpMsgRequest</a></li><li><a href="OpMsgResponse.html">OpMsgResponse</a></li><li><a href="OpQueryRequest.html">OpQueryRequest</a></li><li><a href="OpQueryResponse.html">OpQueryResponse</a></li><li><a href="OptionsOperation.html">OptionsOperation</a></li><li><a href="OrderedBulkOperation.html">OrderedBulkOperation</a></li><li><a href="OverwriteModelError.html">OverwriteModelError</a></li><li><a href="ParallelSaveError.html">ParallelSaveError</a></li><li><a href="ParallelValidateError.html">ParallelValidateError</a></li><li><a href="PoolClearedError.html">PoolClearedError</a></li><li><a href="PoolClearedOnNetworkError.html">PoolClearedOnNetworkError</a></li><li><a href="PoolClosedError.html">PoolClosedError</a></li><li><a href="ProfilingLevelOperation.html">ProfilingLevelOperation</a></li><li><a href="RTTPinger.html">RTTPinger</a></li><li><a href="ReadConcern.html">ReadConcern</a></li><li><a href="ReadPreference.html">ReadPreference</a></li><li><a href="RemoveUserOperation.html">RemoveUserOperation</a></li><li><a href="RenameOperation.html">RenameOperation</a></li><li><a href="ReplaceOneOperation.html">ReplaceOneOperation</a></li><li><a href="global.html#Request">Request</a></li><li><a href="Response.html">Response</a></li><li><a href="Result.html">Result</a></li><li><a href="RunCommandCursor.html">RunCommandCursor</a></li><li><a href="RunCommandOperation.html">RunCommandOperation</a></li><li><a href="SchemaArrayOptions.html">SchemaArrayOptions</a></li><li><a href="SchemaBufferOptions.html">SchemaBufferOptions</a></li><li><a href="SchemaDateOptions.html">SchemaDateOptions</a></li><li><a href="SchemaDocumentOptions.html">SchemaDocumentOptions</a></li><li><a href="SchemaMapOptions.html">SchemaMapOptions</a></li><li><a href="SchemaNumberOptions.html">SchemaNumberOptions</a></li><li><a href="SchemaObjectIdOptions.html">SchemaObjectIdOptions</a></li><li><a href="SchemaStringOptions.html">SchemaStringOptions</a></li><li><a href="SchemaSubdocumentOptions.html">SchemaSubdocumentOptions</a></li><li><a href="global.html#SchemaTypeOptions">SchemaTypeOptions</a></li><li><a href="Server.html">Server</a></li><li><a href="ServerCapabilities.html">ServerCapabilities</a></li><li><a href="ServerClosedEvent.html">ServerClosedEvent</a></li><li><a href="ServerDescription.html">ServerDescription</a></li><li><a href="ServerDescriptionChangedEvent.html">ServerDescriptionChangedEvent</a></li><li><a href="ServerHeartbeatFailedEvent.html">ServerHeartbeatFailedEvent</a></li><li><a href="ServerHeartbeatStartedEvent.html">ServerHeartbeatStartedEvent</a></li><li><a href="ServerHeartbeatSucceededEvent.html">ServerHeartbeatSucceededEvent</a></li><li><a href="ServerOpeningEvent.html">ServerOpeningEvent</a></li><li><a href="ServerSession.html">ServerSession</a></li><li><a href="ServerSessionPool.html">ServerSessionPool</a></li><li><a href="ServiceWorkflow.html">ServiceWorkflow</a></li><li><a href="SessionStrategy.html">SessionStrategy</a></li><li><a href="SetOptionError.html">SetOptionError</a></li><li><a href="SetOptionInnerError.html">SetOptionInnerError</a></li><li><a href="SetProfilingLevelOperation.html">SetProfilingLevelOperation</a></li><li><a href="SeverityLevelMap.html">SeverityLevelMap</a></li><li><a href="SrvPoller.html">SrvPoller</a></li><li><a href="SrvPollingEvent.html">SrvPollingEvent</a></li><li><a href="global.html#StateMachine">StateMachine</a></li><li><a href="global.html#Strategy">Strategy</a></li><li><a href="StreamDescription.html">StreamDescription</a></li><li><a href="StrictModeError.html">StrictModeError</a></li><li><a href="StrictPopulateError.html">StrictPopulateError</a></li><li><a href="SyncIndexesError.html">SyncIndexesError</a></li><li><a href="TimeoutController.html">TimeoutController</a></li><li><a href="TokenEntry.html">TokenEntry</a></li><li><a href="TokenEntryCache.html">TokenEntryCache</a></li><li><a href="Topology.html">Topology</a></li><li><a href="TopologyClosedEvent.html">TopologyClosedEvent</a></li><li><a href="TopologyDescription.html">TopologyDescription</a></li><li><a href="TopologyDescriptionChangedEvent.html">TopologyDescriptionChangedEvent</a></li><li><a href="TopologyOpeningEvent.html">TopologyOpeningEvent</a></li><li><a href="Transaction.html">Transaction</a></li><li><a href="TypedEventEmitter.html">TypedEventEmitter</a></li><li><a href="UUID.html">UUID</a></li><li><a href="UnorderedBulkOperation.html">UnorderedBulkOperation</a></li><li><a href="UpdateManyOperation.html">UpdateManyOperation</a></li><li><a href="UpdateOneOperation.html">UpdateOneOperation</a></li><li><a href="UpdateOperation.html">UpdateOperation</a></li><li><a href="UpdateSearchIndexOperation.html">UpdateSearchIndexOperation</a></li><li><a href="ValidateCollectionOperation.html">ValidateCollectionOperation</a></li><li><a href="ValidationError.html">ValidationError</a></li><li><a href="ValidatorError.html">ValidatorError</a></li><li><a href="VersionError.html">VersionError</a></li><li><a href="WaitQueueTimeoutError.html">WaitQueueTimeoutError</a></li><li><a href="WriteConcern.html">WriteConcern</a></li><li><a href="WriteConcernError.html">WriteConcernError</a></li><li><a href="WriteError.html">WriteError</a></li><li><a href="-_.html">_</a></li></ul><h3>Events</h3><ul><li><a href="AbstractCursor.html#.event:CLOSE">CLOSE</a></li><li><a href="ChangeStream.html#.event:CHANGE">CHANGE</a></li><li><a href="ChangeStream.html#.event:CLOSE">CLOSE</a></li><li><a href="ChangeStream.html#.event:END">END</a></li><li><a href="ChangeStream.html#.event:ERROR">ERROR</a></li><li><a href="ChangeStream.html#.event:INIT">INIT</a></li><li><a href="ChangeStream.html#.event:MORE">MORE</a></li><li><a href="ChangeStream.html#.event:RESPONSE">RESPONSE</a></li><li><a href="ChangeStream.html#.event:RESUME_TOKEN_CHANGED">RESUME_TOKEN_CHANGED</a></li><li><a href="Connection.html#.event:CLOSE">CLOSE</a></li><li><a href="Connection.html#.event:CLUSTER_TIME_RECEIVED">CLUSTER_TIME_RECEIVED</a></li><li><a href="Connection.html#.event:COMMAND_FAILED">COMMAND_FAILED</a></li><li><a href="Connection.html#.event:COMMAND_STARTED">COMMAND_STARTED</a></li><li><a href="Connection.html#.event:COMMAND_SUCCEEDED">COMMAND_SUCCEEDED</a></li><li><a href="Connection.html#.event:MESSAGE">MESSAGE</a></li><li><a href="Connection.html#.event:PINNED">PINNED</a></li><li><a href="Connection.html#.event:UNPINNED">UNPINNED</a></li><li><a href="ConnectionPool.html#.event:CONNECTION_CHECKED_IN">CONNECTION_CHECKED_IN</a></li><li><a href="ConnectionPool.html#.event:CONNECTION_CHECKED_OUT">CONNECTION_CHECKED_OUT</a></li><li><a href="ConnectionPool.html#.event:CONNECTION_CHECK_OUT_FAILED">CONNECTION_CHECK_OUT_FAILED</a></li><li><a href="ConnectionPool.html#.event:CONNECTION_CHECK_OUT_STARTED">CONNECTION_CHECK_OUT_STARTED</a></li><li><a href="ConnectionPool.html#.event:CONNECTION_CLOSED">CONNECTION_CLOSED</a></li><li><a href="ConnectionPool.html#.event:CONNECTION_CREATED">CONNECTION_CREATED</a></li><li><a href="ConnectionPool.html#.event:CONNECTION_POOL_CLEARED">CONNECTION_POOL_CLEARED</a></li><li><a href="ConnectionPool.html#.event:CONNECTION_POOL_CLOSED">CONNECTION_POOL_CLOSED</a></li><li><a href="ConnectionPool.html#.event:CONNECTION_POOL_CREATED">CONNECTION_POOL_CREATED</a></li><li><a href="ConnectionPool.html#.event:CONNECTION_POOL_READY">CONNECTION_POOL_READY</a></li><li><a href="ConnectionPool.html#.event:CONNECTION_READY">CONNECTION_READY</a></li><li><a href="GridFSBucket.html#.event:INDEX">INDEX</a></li><li><a href="GridFSBucketReadStream.html#.event:FILE">FILE</a></li><li><a href="ModernConnection.html#.event:CLOSE">CLOSE</a></li><li><a href="ModernConnection.html#.event:CLUSTER_TIME_RECEIVED">CLUSTER_TIME_RECEIVED</a></li><li><a href="ModernConnection.html#.event:COMMAND_FAILED">COMMAND_FAILED</a></li><li><a href="ModernConnection.html#.event:COMMAND_STARTED">COMMAND_STARTED</a></li><li><a href="ModernConnection.html#.event:COMMAND_SUCCEEDED">COMMAND_SUCCEEDED</a></li><li><a href="ModernConnection.html#.event:MESSAGE">MESSAGE</a></li><li><a href="ModernConnection.html#.event:PINNED">PINNED</a></li><li><a href="ModernConnection.html#.event:UNPINNED">UNPINNED</a></li><li><a href="Server.html#.event:CLOSED">CLOSED</a></li><li><a href="Server.html#.event:CONNECT">CONNECT</a></li><li><a href="Server.html#.event:DESCRIPTION_RECEIVED">DESCRIPTION_RECEIVED</a></li><li><a href="Server.html#.event:ENDED">ENDED</a></li><li><a href="Server.html#.event:SERVER_HEARTBEAT_FAILED">SERVER_HEARTBEAT_FAILED</a></li><li><a href="Server.html#.event:SERVER_HEARTBEAT_STARTED">SERVER_HEARTBEAT_STARTED</a></li><li><a href="Server.html#.event:SERVER_HEARTBEAT_SUCCEEDED">SERVER_HEARTBEAT_SUCCEEDED</a></li><li><a href="SrvPoller.html#.event:SRV_RECORD_DISCOVERY">SRV_RECORD_DISCOVERY</a></li><li><a href="Topology.html#.event:CLOSE">CLOSE</a></li><li><a href="Topology.html#.event:CONNECT">CONNECT</a></li><li><a href="Topology.html#.event:ERROR">ERROR</a></li><li><a href="Topology.html#.event:OPEN">OPEN</a></li><li><a href="Topology.html#.event:SERVER_CLOSED">SERVER_CLOSED</a></li><li><a href="Topology.html#.event:SERVER_DESCRIPTION_CHANGED">SERVER_DESCRIPTION_CHANGED</a></li><li><a href="Topology.html#.event:SERVER_OPENING">SERVER_OPENING</a></li><li><a href="Topology.html#.event:TIMEOUT">TIMEOUT</a></li><li><a href="Topology.html#.event:TOPOLOGY_CLOSED">TOPOLOGY_CLOSED</a></li><li><a href="Topology.html#.event:TOPOLOGY_DESCRIPTION_CHANGED">TOPOLOGY_DESCRIPTION_CHANGED</a></li><li><a href="Topology.html#.event:TOPOLOGY_OPENING">TOPOLOGY_OPENING</a></li><li><a href="%2560index-single-done%2560_%2520Emitted%2520when%2520an%2520individual%2520index%2520finishes%2520within%2520%2560Model_ensureIndexes%2560.%2520If%2520an%2520error%2520occurred%2520it%2520is%2520passed%2520with%2520the%2520event.%2520The%2520fields,%2520options.html#event:andindexnamearealsopassed."> and index name are also passed.</a></li><li><a href="global.html#event:%2560end%2560:Emittedwhenthestreamisexhausted">`end`: Emitted when the stream is exhausted</a></li><li><a href="global.html#event:%2560fullsetup%2560:Emittedafterthedriverhasconnectedtoprimaryandallsecondariesifspecifiedintheconnectionstring.">`fullsetup`: Emitted after the driver has connected to primary and all secondaries if specified in the connection string.</a></li><li><a href="global.html#event:%2560init%2560:Emittedaftertheschemaiscompiledintoa%2560Model%2560.">`init`: Emitted after the schema is compiled into a `Model`.</a></li><li><a href="global.html#event:%2560save%2560:Emittedwhenthedocumentissuccessfullysaved">`save`: Emitted when the document is successfully saved</a></li></ul><h3>Global</h3><ul><li><a href="global.html"></a></li><li><a href="global.html#$__save">$__save</a></li><li><a href="global.html#$format">$format</a></li><li><a href="global.html#$model">$model</a></li><li><a href="global.html#$parent">$parent</a></li><li><a href="global.html#$print">$print</a></li><li><a href="global.html#$withinCmd">$withinCmd</a></li><li><a href="global.html#APM_EVENTS">APM_EVENTS</a></li><li><a href="global.html#AUTH_MECHS_AUTH_SRC_EXTERNAL">AUTH_MECHS_AUTH_SRC_EXTERNAL</a></li><li><a href="global.html#AUTH_PROVIDERS">AUTH_PROVIDERS</a></li><li><a href="global.html#AZURE_BASE_URL">AZURE_BASE_URL</a></li><li><a href="global.html#AZURE_HEADERS">AZURE_HEADERS</a></li><li><a href="global.html#AbortError">AbortError</a></li><li><a href="global.html#Accepts">Accepts</a></li><li><a href="global.html#Aggregate">Aggregate</a></li><li><a href="global.html#ArraySubdocument">ArraySubdocument</a></li><li><a href="global.html#AuthMechanism">AuthMechanism</a></li><li><a href="global.html#AutoEncryptionLoggerLevel">AutoEncryptionLoggerLevel</a></li><li><a href="global.html#BatchType">BatchType</a></li><li><a href="global.html#Body">Body</a></li><li><a href="global.html#Buffer">Buffer</a></li><li><a href="global.html#CALLBACK_RESULT_ERROR">CALLBACK_RESULT_ERROR</a></li><li><a href="global.html#CLONE_DEEP_FLAG">CLONE_DEEP_FLAG</a></li><li><a href="global.html#CLONE_SYMBOLS_FLAG">CLONE_SYMBOLS_FLAG</a></li><li><a href="global.html#CMAP_EVENTS">CMAP_EVENTS</a></li><li><a href="global.html#CONNECTION_CHECKED_IN">CONNECTION_CHECKED_IN</a></li><li><a href="global.html#CONNECTION_CHECKED_OUT">CONNECTION_CHECKED_OUT</a></li><li><a href="global.html#CONNECTION_CHECK_OUT_FAILED">CONNECTION_CHECK_OUT_FAILED</a></li><li><a href="global.html#CONNECTION_CHECK_OUT_STARTED">CONNECTION_CHECK_OUT_STARTED</a></li><li><a href="global.html#CONNECTION_CLOSED">CONNECTION_CLOSED</a></li><li><a href="global.html#CONNECTION_CREATED">CONNECTION_CREATED</a></li><li><a href="global.html#CONNECTION_POOL_CLEARED">CONNECTION_POOL_CLEARED</a></li><li><a href="global.html#CONNECTION_POOL_CLOSED">CONNECTION_POOL_CLOSED</a></li><li><a href="global.html#CONNECTION_POOL_CREATED">CONNECTION_POOL_CREATED</a></li><li><a href="global.html#CONNECTION_POOL_READY">CONNECTION_POOL_READY</a></li><li><a href="global.html#CONNECTION_READY">CONNECTION_READY</a></li><li><a href="global.html#CORE_ERROR_TEXT">CORE_ERROR_TEXT</a></li><li><a href="global.html#COSMOS_DB_CHECK">COSMOS_DB_CHECK</a></li><li><a href="global.html#COSMOS_DB_MSG">COSMOS_DB_MSG</a></li><li><a href="global.html#CURSOR_FLAGS">CURSOR_FLAGS</a></li><li><a href="global.html#Compressor">Compressor</a></li><li><a href="global.html#DB_AGGREGATE_COLLECTION">DB_AGGREGATE_COLLECTION</a></li><li><a href="global.html#DEFAULT_ALLOWED_HOSTS">DEFAULT_ALLOWED_HOSTS</a></li><li><a href="global.html#DEFAULT_MAX_DOCUMENT_LENGTH">DEFAULT_MAX_DOCUMENT_LENGTH</a></li><li><a href="global.html#DEFAULT_TRUNC_LENGTH">DEFAULT_TRUNC_LENGTH</a></li><li><a href="global.html#DOCUMENT_DB_CHECK">DOCUMENT_DB_CHECK</a></li><li><a href="global.html#DOCUMENT_DB_MSG">DOCUMENT_DB_MSG</a></li><li><a href="global.html#Delegator">Delegator</a></li><li><a href="global.html#DeprecationError">DeprecationError</a></li><li><a href="global.html#Document">Document</a></li><li><a href="global.html#DocumentProvider">DocumentProvider</a></li><li><a href="global.html#ENDPOINT_RESULT_ERROR">ENDPOINT_RESULT_ERROR</a></li><li><a href="global.html#ExplainVerbosity">ExplainVerbosity</a></li><li><a href="global.html#FEATURE_FLAGS">FEATURE_FLAGS</a></li><li><a href="global.html#FIELD_NAME_REGEXP">FIELD_NAME_REGEXP</a></li><li><a href="global.html#FIRST_CHAR_REGEXP">FIRST_CHAR_REGEXP</a></li><li><a href="global.html#FLAGS">FLAGS</a></li><li><a href="global.html#FUNC_ERROR_TEXT">FUNC_ERROR_TEXT</a></li><li><a href="global.html#FetchError">FetchError</a></li><li><a href="global.html#GLIBC">GLIBC</a></li><li><a href="global.html#GLIBC_ON_LDD">GLIBC_ON_LDD</a></li><li><a href="global.html#GSSAPICanonicalizationValue">GSSAPICanonicalizationValue</a></li><li><a href="global.html#HEARTBEAT_EVENTS">HEARTBEAT_EVENTS</a></li><li><a href="global.html#INFINITY">INFINITY</a></li><li><a href="global.html#INVALID_TEMPL_VAR_ERROR_TEXT">INVALID_TEMPL_VAR_ERROR_TEXT</a></li><li><a href="global.html#IPv4SegmentFormat">IPv4SegmentFormat</a></li><li><a href="global.html#IncomingMessageExt">IncomingMessageExt</a></li><li><a href="global.html#JwtStrategy">JwtStrategy</a></li><li><a href="global.html#Kareem">Kareem</a></li><li><a href="global.html#LDD_PATH">LDD_PATH</a></li><li><a href="global.html#LEGACY_HELLO_COMMAND">LEGACY_HELLO_COMMAND</a></li><li><a href="global.html#LEGACY_HELLO_COMMAND_CAMEL_CASE">LEGACY_HELLO_COMMAND_CAMEL_CASE</a></li><li><a href="global.html#LEGACY_NOT_PRIMARY_OR_SECONDARY_ERROR_MESSAGE">LEGACY_NOT_PRIMARY_OR_SECONDARY_ERROR_MESSAGE</a></li><li><a href="global.html#LEGACY_NOT_WRITABLE_PRIMARY_ERROR_MESSAGE">LEGACY_NOT_WRITABLE_PRIMARY_ERROR_MESSAGE</a></li><li><a href="global.html#LEGACY_REGIONS">LEGACY_REGIONS</a></li><li><a href="global.html#LEGAL_TCP_SOCKET_OPTIONS">LEGAL_TCP_SOCKET_OPTIONS</a></li><li><a href="global.html#LEGAL_TLS_SOCKET_OPTIONS">LEGAL_TLS_SOCKET_OPTIONS</a></li><li><a href="global.html#LENGTH_EAN_8">LENGTH_EAN_8</a></li><li><a href="global.html#LOCAL_SERVER_EVENTS">LOCAL_SERVER_EVENTS</a></li><li><a href="global.html#MATCHING_GROUP_REGEXP">MATCHING_GROUP_REGEXP</a></li><li><a href="global.html#MAX_ARRAY_LENGTH">MAX_ARRAY_LENGTH</a></li><li><a href="global.html#MAX_SAFE_INTEGER">MAX_SAFE_INTEGER</a></li><li><a href="global.html#MISSING_CREDENTIALS_ERROR">MISSING_CREDENTIALS_ERROR</a></li><li><a href="global.html#MONGODB_ERROR_CODES">MONGODB_ERROR_CODES</a></li><li><a href="global.html#MONGODB_OIDC">MONGODB_OIDC</a></li><li><a href="global.html#MONGODB_WARNING_CODE">MONGODB_WARNING_CODE</a></li><li><a href="global.html#MONGO_CLIENT_EVENTS">MONGO_CLIENT_EVENTS</a></li><li><a href="global.html#MUSL">MUSL</a></li><li><a href="global.html#MUSL_ON_LDD">MUSL_ON_LDD</a></li><li><a href="global.html#Model">Model</a></li><li><a href="global.html#MongoErrorLabel">MongoErrorLabel</a></li><li><a href="global.html#MongoLoggableComponent">MongoLoggableComponent</a></li><li><a href="global.html#Mongoose">Mongoose</a></li><li><a href="global.html#MongooseBuffer">MongooseBuffer</a></li><li><a href="global.html#MongooseDocumentArray">MongooseDocumentArray</a></li><li><a href="global.html#NAN">NAN</a></li><li><a href="global.html#NODE_IS_RECOVERING_ERROR_MESSAGE">NODE_IS_RECOVERING_ERROR_MESSAGE</a></li><li><a href="global.html#NativeCollection">NativeCollection</a></li><li><a href="global.html#NativeConnection">NativeConnection</a></li><li><a href="global.html#Negotiator">Negotiator</a></li><li><a href="global.html#OIDC_VERSION">OIDC_VERSION</a></li><li><a href="global.html#OIDC_WORKFLOWS">OIDC_WORKFLOWS</a></li><li><a href="global.html#PARAM_REGEXP">PARAM_REGEXP</a></li><li><a href="global.html#Passport">Passport</a></li><li><a href="global.html#PoolState">PoolState</a></li><li><a href="global.html#ProfilingLevel">ProfilingLevel</a></li><li><a href="global.html#QESC_REGEXP">QESC_REGEXP</a></li><li><a href="global.html#QUOTE_REGEXP">QUOTE_REGEXP</a></li><li><a href="global.html#Query">Query</a></li><li><a href="global.html#REQUEST_CALLBACK_REQUIRED_ERROR">REQUEST_CALLBACK_REQUIRED_ERROR</a></li><li><a href="global.html#RESULT_PROPERTIES">RESULT_PROPERTIES</a></li><li><a href="global.html#RE_GLIBC_VERSION">RE_GLIBC_VERSION</a></li><li><a href="global.html#ReadConcernLevel">ReadConcernLevel</a></li><li><a href="global.html#ReadPreferenceMode">ReadPreferenceMode</a></li><li><a href="global.html#ReturnDocument">ReturnDocument</a></li><li><a href="global.html#Route">Route</a></li><li><a href="global.html#SENSITIVE_COMMANDS">SENSITIVE_COMMANDS</a></li><li><a href="global.html#SERVER_RELAY_EVENTS">SERVER_RELAY_EVENTS</a></li><li><a href="global.html#SEVERITY_LEVEL_MAP">SEVERITY_LEVEL_MAP</a></li><li><a href="global.html#Schema">Schema</a></li><li><a href="global.html#SchemaArray">SchemaArray</a></li><li><a href="global.html#SchemaBigInt">SchemaBigInt</a></li><li><a href="global.html#SchemaBoolean">SchemaBoolean</a></li><li><a href="global.html#SchemaBuffer">SchemaBuffer</a></li><li><a href="global.html#SchemaDate">SchemaDate</a></li><li><a href="global.html#SchemaDecimal128">SchemaDecimal128</a></li><li><a href="global.html#SchemaDocumentArray">SchemaDocumentArray</a></li><li><a href="global.html#SchemaDocumentArrayElement">SchemaDocumentArrayElement</a></li><li><a href="global.html#SchemaMixed">SchemaMixed</a></li><li><a href="global.html#SchemaNumber">SchemaNumber</a></li><li><a href="global.html#SchemaObjectId">SchemaObjectId</a></li><li><a href="global.html#SchemaString">SchemaString</a></li><li><a href="global.html#SchemaSubdocument">SchemaSubdocument</a></li><li><a href="global.html#SchemaType">SchemaType</a></li><li><a href="global.html#SchemaUUID">SchemaUUID</a></li><li><a href="global.html#ServerApiVersion">ServerApiVersion</a></li><li><a href="global.html#ServerMonitoringMode">ServerMonitoringMode</a></li><li><a href="global.html#ServerType">ServerType</a></li><li><a href="global.html#SeverityLevel">SeverityLevel</a></li><li><a href="global.html#Subdocument">Subdocument</a></li><li><a href="global.html#TIMEOUT_S">TIMEOUT_S</a></li><li><a href="global.html#TOKEN_AUDIENCE_MISSING_ERROR">TOKEN_AUDIENCE_MISSING_ERROR</a></li><li><a href="global.html#TOKEN_MISSING_ERROR">TOKEN_MISSING_ERROR</a></li><li><a href="global.html#TOPOLOGY_EVENTS">TOPOLOGY_EVENTS</a></li><li><a href="global.html#TYPE_REGEXP">TYPE_REGEXP</a></li><li><a href="global.html#TopologyType">TopologyType</a></li><li><a href="global.html#TxnState">TxnState</a></li><li><a href="global.html#Types">Types</a></li><li><a href="global.html#View">View</a></li><li><a href="global.html#VirtualType">VirtualType</a></li><li><a href="global.html#WRAP_ARY_FLAG">WRAP_ARY_FLAG</a></li><li><a href="global.html#WRAP_BIND_FLAG">WRAP_BIND_FLAG</a></li><li><a href="global.html#WRAP_CURRY_FLAG">WRAP_CURRY_FLAG</a></li><li><a href="global.html#WRAP_CURRY_RIGHT_FLAG">WRAP_CURRY_RIGHT_FLAG</a></li><li><a href="global.html#WRAP_FLIP_FLAG">WRAP_FLIP_FLAG</a></li><li><a href="global.html#WRAP_PARTIAL_FLAG">WRAP_PARTIAL_FLAG</a></li><li><a href="global.html#WRAP_PARTIAL_RIGHT_FLAG">WRAP_PARTIAL_RIGHT_FLAG</a></li><li><a href="global.html#WRAP_REARG_FLAG">WRAP_REARG_FLAG</a></li><li><a href="global.html#_advanceClusterTime">_advanceClusterTime</a></li><li><a href="global.html#_basePush">_basePush</a></li><li><a href="global.html#_checkContext">_checkContext</a></li><li><a href="global.html#_filterInvalidIds">_filterInvalidIds</a></li><li><a href="global.html#_formatMatch">_formatMatch</a></li><li><a href="global.html#_getOption">_getOption</a></li><li><a href="global.html#_next">_next</a></li><li><a href="global.html#_orFailError">_orFailError</a></li><li><a href="global.html#_populate">_populate</a></li><li><a href="global.html#_toString">_toString</a></li><li><a href="global.html#_update">_update</a></li><li><a href="global.html#_updateExec">_updateExec</a></li><li><a href="global.html#_updateParentPopulated">_updateParentPopulated</a></li><li><a href="global.html#acceptParams">acceptParams</a></li><li><a href="global.html#addCursorFlag">addCursorFlag</a></li><li><a href="global.html#aliasFields">aliasFields</a></li><li><a href="global.html#alladdrs">alladdrs</a></li><li><a href="global.html#app">app</a></li><li><a href="global.html#append">append</a></li><li><a href="global.html#application">application</a></li><li><a href="global.html#applyGetters">applyGetters</a></li><li><a href="global.html#applyHooks">applyHooks</a></li><li><a href="global.html#applyQueryMethods">applyQueryMethods</a></li><li><a href="global.html#applyQueryMiddleware">applyQueryMiddleware</a></li><li><a href="global.html#applyRetryableWrites">applyRetryableWrites</a></li><li><a href="global.html#applySchemaTypeTransforms">applySchemaTypeTransforms</a></li><li><a href="global.html#applySession">applySession</a></li><li><a href="global.html#argsTag">argsTag</a></li><li><a href="global.html#arrayFlatten">arrayFlatten</a></li><li><a href="global.html#arrayProto">arrayProto</a></li><li><a href="global.html#arrayStrictEqual">arrayStrictEqual</a></li><li><a href="global.html#assert">assert</a></li><li><a href="global.html#assertUninitialized">assertUninitialized</a></li><li><a href="global.html#assignRawDocsToIdStructure">assignRawDocsToIdStructure</a></li><li><a href="global.html#asyncTag">asyncTag</a></li><li><a href="global.html#auth">auth</a></li><li><a href="global.html#base">base</a></li><li><a href="global.html#baseMinusTMin">baseMinusTMin</a></li><li><a href="global.html#basePath">basePath</a></li><li><a href="global.html#binary2hex">binary2hex</a></li><li><a href="global.html#binaryToString">binaryToString</a></li><li><a href="global.html#body">body</a></li><li><a href="global.html#bodyParser">bodyParser</a></li><li><a href="global.html#boolTag">boolTag</a></li><li><a href="global.html#bson_1">bson_1</a></li><li><a href="global.html#buildCheckFunction">buildCheckFunction</a></li><li><a href="global.html#bytes">bytes</a></li><li><a href="global.html#calculateCheckDigit">calculateCheckDigit</a></li><li><a href="global.html#calculateDurationInMs">calculateDurationInMs</a></li><li><a href="global.html#callSiteLocation">callSiteLocation</a></li><li><a href="global.html#castOps">castOps</a></li><li><a href="global.html#castUpdateVal">castUpdateVal</a></li><li><a href="global.html#charset">charset</a></li><li><a href="global.html#check">check</a></li><li><a href="global.html#checkDivergentArray">checkDivergentArray</a></li><li><a href="global.html#checkExact">checkExact</a></li><li><a href="global.html">checkRequired</a></li><li><a href="global.html#checkSchema">checkSchema</a></li><li><a href="global.html#checkTLSOptions">checkTLSOptions</a></li><li><a href="global.html#checkValidKey">checkValidKey</a></li><li><a href="global.html#clone">clone</a></li><li><a href="global.html#close">close</a></li><li><a href="global.html#coerce">coerce</a></li><li><a href="global.html#colors">colors</a></li><li><a href="global.html#commandDocument">commandDocument</a></li><li><a href="global.html#compareObjectId">compareObjectId</a></li><li><a href="global.html#compareTopologyVersion">compareTopologyVersion</a></li><li><a href="global.html#compile">compile</a></li><li><a href="global.html#compileETag">compileETag</a></li><li><a href="global.html#compileQueryParser">compileQueryParser</a></li><li><a href="global.html#compileTrust">compileTrust</a></li><li><a href="global.html#completeMany">completeMany</a></li><li><a href="global.html#completeOne">completeOne</a></li><li><a href="global.html#compressCommand">compressCommand</a></li><li><a href="global.html#config">config</a></li><li><a href="global.html#consumeBody">consumeBody</a></li><li><a href="global.html#containsDotFile">containsDotFile</a></li><li><a href="global.html#containsNamespace">containsNamespace</a></li><li><a href="global.html#contentDisposition">contentDisposition</a></li><li><a href="global.html#contentRange">contentRange</a></li><li><a href="global.html#contentType">contentType</a></li><li><a href="global.html#contentstream">contentstream</a></li><li><a href="global.html#convert">convert</a></li><li><a href="global.html#convertBody">convertBody</a></li><li><a href="global.html#convertDataDescriptorToAccessor">convertDataDescriptorToAccessor</a></li><li><a href="global.html#convertNewToReturnDocument">convertNewToReturnDocument</a></li><li><a href="global.html#convertTo_id">convertTo_id</a></li><li><a href="global.html#cookie">cookie</a></li><li><a href="global.html#create">create</a></li><li><a href="global.html#createAndConnectServer">createAndConnectServer</a></li><li><a href="global.html#createApplication">createApplication</a></li><li><a href="global.html#createArgumentsString">createArgumentsString</a></li><li><a href="global.html#createBufferStream">createBufferStream</a></li><li><a href="global.html#createCheckSchema">createCheckSchema</a></li><li><a href="global.html#createCollection">createCollection</a></li><li><a href="global.html#createCollections">createCollections</a></li><li><a href="global.html#createDebug">createDebug</a></li><li><a href="global.html#createError">createError</a></li><li><a href="global.html#createHeadersLenient">createHeadersLenient</a></li><li><a href="global.html#createModel">createModel</a></li><li><a href="global.html#createStackString">createStackString</a></li><li><a href="global.html#createStdioLogger">createStdioLogger</a></li><li><a href="global.html#createWritableStdioStream">createWritableStdioStream</a></li><li><a href="global.html#crypto">crypto</a></li><li><a href="global.html#debug">debug</a></li><li><a href="global.html#decideModelByObject">decideModelByObject</a></li><li><a href="global.html#decode">decode</a></li><li><a href="global.html#decompressResponse">decompressResponse</a></li><li><a href="global.html#decorate">decorate</a></li><li><a href="global.html#decorateDecryptionResult">decorateDecryptionResult</a></li><li><a href="global.html#decorateWithCollation">decorateWithCollation</a></li><li><a href="global.html#decorateWithExplain">decorateWithExplain</a></li><li><a href="global.html#decorateWithReadConcern">decorateWithReadConcern</a></li><li><a href="global.html#deepCopy">deepCopy</a></li><li><a href="global.html#deepEqual">deepEqual</a></li><li><a href="global.html#deepToMap">deepToMap</a></li><li><a href="global.html#defaultMessage">defaultMessage</a></li><li><a href="global.html#defineKey">defineKey</a></li><li><a href="global.html#depd">depd</a></li><li><a href="global.html#deprecate">deprecate</a></li><li><a href="global.html#destroy">destroy</a></li><li><a href="global.html#destroyServer">destroyServer</a></li><li><a href="global.html#dir">dir</a></li><li><a href="global.html#disable">disable</a></li><li><a href="global.html#domExcTag">domExcTag</a></li><li><a href="global.html#drainTimerQueue">drainTimerQueue</a></li><li><a href="global.html#dropCollection">dropCollection</a></li><li><a href="global.html#dropDatabase">dropDatabase</a></li><li><a href="global.html#dump">dump</a></li><li><a href="global.html#each">each</a></li><li><a href="global.html#eachAsync">eachAsync</a></li><li><a href="global.html#emitWarning">emitWarning</a></li><li><a href="global.html#emitWarningOnce">emitWarningOnce</a></li><li><a href="global.html#enable">enable</a></li><li><a href="global.html#enabled">enabled</a></li><li><a href="global.html#encode">encode</a></li><li><a href="global.html#encodeUrl">encodeUrl</a></li><li><a href="global.html#enumToString">enumToString</a></li><li><a href="global.html#errorStrictEqual">errorStrictEqual</a></li><li><a href="global.html#errors">errors</a></li><li><a href="global.html#escapeHtml">escapeHtml</a></li><li><a href="global.html#etag">etag</a></li><li><a href="global.html#expires">expires</a></li><li><a href="global.html#exportNodeCompatibleHeaders">exportNodeCompatibleHeaders</a></li><li><a href="global.html#extendedparser">extendedparser</a></li><li><a href="global.html#extension">extension</a></li><li><a href="global.html#extractCommand">extractCommand</a></li><li><a href="global.html#extractContentType">extractContentType</a></li><li><a href="global.html#family">family</a></li><li><a href="global.html#familySync">familySync</a></li><li><a href="global.html#fd">fd</a></li><li><a href="global.html#fetch">fetch</a></li><li><a href="global.html#fetchAzureKMSToken">fetchAzureKMSToken</a></li><li><a href="global.html#fieldContentRegExp">fieldContentRegExp</a></li><li><a href="global.html#filterOptions">filterOptions</a></li><li><a href="global.html#finalhandler">finalhandler</a></li><li><a href="global.html#find">find</a></li><li><a href="global.html#findUnknownFields">findUnknownFields</a></li><li><a href="global.html#finishCommandDocument">finishCommandDocument</a></li><li><a href="global.html#first">first</a></li><li><a href="global.html#flatten">flatten</a></li><li><a href="global.html#flattenForever">flattenForever</a></li><li><a href="global.html#flattenWithDepth">flattenWithDepth</a></li><li><a href="global.html#fmtLong">fmtLong</a></li><li><a href="global.html#fmtShort">fmtShort</a></li><li><a href="global.html#format">format</a></li><li><a href="global.html#formatArgs">formatArgs</a></li><li><a href="global.html#formatColor">formatColor</a></li><li><a href="global.html#formatLocation">formatLocation</a></li><li><a href="global.html#formatMessage">formatMessage</a></li><li><a href="global.html#formatPlain">formatPlain</a></li><li><a href="global.html#formatSort">formatSort</a></li><li><a href="global.html#formatters">formatters</a></li><li><a href="global.html#forwarded">forwarded</a></li><li><a href="global.html#freeExports">freeExports</a></li><li><a href="global.html#freeModule">freeModule</a></li><li><a href="global.html#freeParseFloat">freeParseFloat</a></li><li><a href="global.html#freeParseInt">freeParseInt</a></li><li><a href="global.html#fresh">fresh</a></li><li><a href="global.html#funcProto">funcProto</a></li><li><a href="global.html#funcToString">funcToString</a></li><li><a href="global.html#get">get</a></li><li><a href="global.html#getAzureTokenData">getAzureTokenData</a></li><li><a href="global.html#getCharset">getCharset</a></li><li><a href="global.html#getCredentials">getCredentials</a></li><li><a href="global.html#getFAASEnv">getFAASEnv</a></li><li><a href="global.html#getFormatFunction">getFormatFunction</a></li><li><a href="global.html#getIndexes">getIndexes</a></li><li><a href="global.html#getMongoDBClientEncryption">getMongoDBClientEncryption</a></li><li><a href="global.html#getNodeRequestOptions">getNodeRequestOptions</a></li><li><a href="global.html#getPositionWeightThroughLengthAndIndex">getPositionWeightThroughLengthAndIndex</a></li><li><a href="global.html#getPositionalPathType">getPositionalPathType</a></li><li><a href="global.html#getPrototype">getPrototype</a></li><li><a href="global.html#getRawBody">getRawBody</a></li><li><a href="global.html#getRuntimeInfo">getRuntimeInfo</a></li><li><a href="global.html#getStack">getStack</a></li><li><a href="global.html#getTopology">getTopology</a></li><li><a href="global.html#getTotalBytes">getTotalBytes</a></li><li><a href="global.html#getValue">getValue</a></li><li><a href="global.html#getWorkflow">getWorkflow</a></li><li><a href="global.html#getcontenttype">getcontenttype</a></li><li><a href="global.html#handle$in">handle$in</a></li><li><a href="global.html#handleAtomics">handleAtomics</a></li><li><a href="global.html#handleSingle">handleSingle</a></li><li><a href="global.html#has">has</a></li><li><a href="global.html#hasAtomicOperators">hasAtomicOperators</a></li><li><a href="global.html#hasKey">hasKey</a></li><li><a href="global.html#hasOnlyValidCountryCodes">hasOnlyValidCountryCodes</a></li><li><a href="global.html#hasOwnProperty">hasOwnProperty</a></li><li><a href="global.html#hasSessionSupport">hasSessionSupport</a></li><li><a href="global.html#hasValidIbanChecksum">hasValidIbanChecksum</a></li><li><a href="global.html#hasValidIbanFormat">hasValidIbanFormat</a></li><li><a href="global.html#hasbody">hasbody</a></li><li><a href="global.html#hashFunctions">hashFunctions</a></li><li><a href="global.html#header">header</a></li><li><a href="global.html#hex2buffer">hex2buffer</a></li><li><a href="global.html#hostMatchesWildcards">hostMatchesWildcards</a></li><li><a href="global.html#http">http</a></li><li><a href="global.html#ibanRegexThroughCountryCode">ibanRegexThroughCountryCode</a></li><li><a href="global.html#idCounter">idCounter</a></li><li><a href="global.html#idGetter">idGetter</a></li><li><a href="global.html#inherits">inherits</a></li><li><a href="global.html#init">init</a></li><li><a href="global.html#initialize">initialize</a></li><li><a href="global.html#inspectOpts">inspectOpts</a></li><li><a href="global.html#inspectable">inspectable</a></li><li><a href="global.html#inspectorLog">inspectorLog</a></li><li><a href="global.html#invalidTokenRegex">invalidTokenRegex</a></li><li><a href="global.html#isAbsolute">isAbsolute</a></li><li><a href="global.html#isArgumentsObject">isArgumentsObject</a></li><li><a href="global.html#isBlob">isBlob</a></li><li><a href="global.html#isBsonType">isBsonType</a></li><li><a href="global.html#isCallbackResultInvalid">isCallbackResultInvalid</a></li><li><a href="global.html#isCanadianSIN">isCanadianSIN</a></li><li><a href="global.html#isEAN">isEAN</a></li><li><a href="global.html#isEmptyCredentials">isEmptyCredentials</a></li><li><a href="global.html#isEmptyObject">isEmptyObject</a></li><li><a href="global.html#isEndpointResultValid">isEndpointResultValid</a></li><li><a href="global.html#isFinished">isFinished</a></li><li><a href="global.html#isHello">isHello</a></li><li><a href="global.html#isHostMatch">isHostMatch</a></li><li><a href="global.html#isMeta">isMeta</a></li><li><a href="global.html#isMongooseType">isMongooseType</a></li><li><a href="global.html#isNativeObject">isNativeObject</a></li><li><a href="global.html#isNonBuiltinObject">isNonBuiltinObject</a></li><li><a href="global.html#isNonGlibcLinux">isNonGlibcLinux</a></li><li><a href="global.html#isNonGlibcLinuxSync">isNonGlibcLinuxSync</a></li><li><a href="global.html#isNullOrUndefined">isNullOrUndefined</a></li><li><a href="global.html#isObject">isObject</a></li><li><a href="global.html#isObjectIdOrHexString">isObjectIdOrHexString</a></li><li><a href="global.html#isOperator">isOperator</a></li><li><a href="global.html#isPOJO">isPOJO</a></li><li><a href="global.html#isPair">isPair</a></li><li><a href="global.html#isPassportNumber">isPassportNumber</a></li><li><a href="global.html#isPopulatedObject">isPopulatedObject</a></li><li><a href="global.html#isPromiseLike">isPromiseLike</a></li><li><a href="global.html#isRequest">isRequest</a></li><li><a href="global.html#isRetryableReadError">isRetryableReadError</a></li><li><a href="global.html#isRetryableWritesEnabled">isRetryableWritesEnabled</a></li><li><a href="global.html#isSDAMUnrecoverableError">isSDAMUnrecoverableError</a></li><li><a href="global.html#isSameProtocol">isSameProtocol</a></li><li><a href="global.html#isURLSearchParams">isURLSearchParams</a></li><li><a href="global.html#isValidObjectId">isValidObjectId</a></li><li><a href="global.html#isignored">isignored</a></li><li><a href="global.html#isstats">isstats</a></li><li><a href="global.html#istraced">istraced</a></li><li><a href="global.html#iter">iter</a></li><li><a href="global.html#json">json</a></li><li><a href="global.html#kAutoEncrypter">kAutoEncrypter</a></li><li><a href="global.html#kBeforeHandshake">kBeforeHandshake</a></li><li><a href="global.html#kBuffer">kBuffer</a></li><li><a href="global.html#kBuiltOptions">kBuiltOptions</a></li><li><a href="global.html#kCancellationToken">kCancellationToken</a></li><li><a href="global.html#kCancelled">kCancelled</a></li><li><a href="global.html#kCheckedOut">kCheckedOut</a></li><li><a href="global.html#kClient">kClient</a></li><li><a href="global.html#kClosed">kClosed</a></li><li><a href="global.html#kClusterTime">kClusterTime</a></li><li><a href="global.html#kConnection">kConnection</a></li><li><a href="global.html#kConnectionCounter">kConnectionCounter</a></li><li><a href="global.html#kConnections">kConnections</a></li><li><a href="global.html#kCursorStream">kCursorStream</a></li><li><a href="global.html#kDecorateResult">kDecorateResult</a></li><li><a href="global.html#kDecoratedKeys">kDecoratedKeys</a></li><li><a href="global.html#kDelayedTimeoutId">kDelayedTimeoutId</a></li><li><a href="global.html#kDescription">kDescription</a></li><li><a href="global.html#kDocuments">kDocuments</a></li><li><a href="global.html#kErrorLabels">kErrorLabels</a></li><li><a href="global.html#kFilter">kFilter</a></li><li><a href="global.html#kGeneration">kGeneration</a></li><li><a href="global.html#kHello">kHello</a></li><li><a href="global.html#kId">kId</a></li><li><a href="global.html#kInit">kInit</a></li><li><a href="global.html#kInitialized">kInitialized</a></li><li><a href="global.html#kInternalClient">kInternalClient</a></li><li><a href="global.html#kKilled">kKilled</a></li><li><a href="global.html#kLastUseTime">kLastUseTime</a></li><li><a href="global.html#kMessageStream">kMessageStream</a></li><li><a href="global.html#kMetrics">kMetrics</a></li><li><a href="global.html#kMinPoolSizeTimer">kMinPoolSizeTimer</a></li><li><a href="global.html#kMode">kMode</a></li><li><a href="global.html#kMonitorId">kMonitorId</a></li><li><a href="global.html#kNamespace">kNamespace</a></li><li><a href="global.html#kNumReturned">kNumReturned</a></li><li><a href="global.html#kOptions">kOptions</a></li><li><a href="global.html#kPending">kPending</a></li><li><a href="global.html#kPinnedConnection">kPinnedConnection</a></li><li><a href="global.html#kPipeline">kPipeline</a></li><li><a href="global.html#kPoolState">kPoolState</a></li><li><a href="global.html#kProcessingWaitQueue">kProcessingWaitQueue</a></li><li><a href="global.html#kQueue">kQueue</a></li><li><a href="global.html#kRoundTripTime">kRoundTripTime</a></li><li><a href="global.html#kServer">kServer</a></li><li><a href="global.html#kServerError">kServerError</a></li><li><a href="global.html#kServerSession">kServerSession</a></li><li><a href="global.html#kServiceGenerations">kServiceGenerations</a></li><li><a href="global.html#kSession">kSession</a></li><li><a href="global.html#kSnapshotEnabled">kSnapshotEnabled</a></li><li><a href="global.html#kSnapshotTime">kSnapshotTime</a></li><li><a href="global.html#kStream">kStream</a></li><li><a href="global.html#kTransform">kTransform</a></li><li><a href="global.html#kTxnNumberIncrement">kTxnNumberIncrement</a></li><li><a href="global.html#kWaitQueue">kWaitQueue</a></li><li><a href="global.html#keys">keys</a></li><li><a href="global.html#last">last</a></li><li><a href="global.html#latencyWindowReducer">latencyWindowReducer</a></li><li><a href="global.html#listCollections">listCollections</a></li><li><a href="global.html#load">load</a></li><li><a href="global.html#loadAWSCredentials">loadAWSCredentials</a></li><li><a href="global.html#loadAzureCredentials">loadAzureCredentials</a></li><li><a href="global.html#loadGCPCredentials">loadGCPCredentials</a></li><li><a href="global.html#loadKrb">loadKrb</a></li><li><a href="global.html#loadZstd">loadZstd</a></li><li><a href="global.html#localstorage">localstorage</a></li><li><a href="global.html#log">log</a></li><li><a href="global.html#lookup">lookup</a></li><li><a href="global.html#makeClientMetadata">makeClientMetadata</a></li><li><a href="global.html#makeCounter">makeCounter</a></li><li><a href="global.html#makeLean">makeLean</a></li><li><a href="global.html#makeStateMachine">makeStateMachine</a></li><li><a href="global.html#mapTag">mapTag</a></li><li><a href="global.html#mapToMap">mapToMap</a></li><li><a href="global.html#matchedData">matchedData</a></li><li><a href="global.html#matchesParentDomain">matchesParentDomain</a></li><li><a href="global.html#maxInt">maxInt</a></li><li><a href="global.html#maxStalenessReducer">maxStalenessReducer</a></li><li><a href="global.html#maxWireVersion">maxWireVersion</a></li><li><a href="global.html#maybeRemoveId">maybeRemoveId</a></li><li><a href="global.html#merge">merge</a></li><li><a href="global.html#mergeBatchResults">mergeBatchResults</a></li><li><a href="global.html#mergeClone">mergeClone</a></li><li><a href="global.html#mergeOptions">mergeOptions</a></li><li><a href="global.html#methods">methods</a></li><li><a href="global.html#mime">mime</a></li><li><a href="global.html#minimize">minimize</a></li><li><a href="global.html#mockS3Http">mockS3Http</a></li><li><a href="global.html#model">model</a></li><li><a href="global.html#moduleExports">moduleExports</a></li><li><a href="global.html#mongoose">mongoose</a></li><li><a href="global.html#morgan">morgan</a></li><li><a href="global.html#mpath">mpath</a></li><li><a href="global.html#multilineRegexp">multilineRegexp</a></li><li><a href="global.html#names">names</a></li><li><a href="global.html#nativeObjectToString">nativeObjectToString</a></li><li><a href="global.html#newObject">newObject</a></li><li><a href="global.html#next">next</a></li><li><a href="global.html#noCastOps">noCastOps</a></li><li><a href="global.html#noPasswordAuthMechanisms">noPasswordAuthMechanisms</a></li><li><a href="global.html#normalizeHintField">normalizeHintField</a></li><li><a href="global.html#normalizeJsonSyntaxError">normalizeJsonSyntaxError</a></li><li><a href="global.html#normalizeType">normalizeType</a></li><li><a href="global.html#normalizeTypes">normalizeTypes</a></li><li><a href="global.html#notImplemented">notImplemented</a></li><li><a href="global.html#now">now</a></li><li><a href="global.html#ns">ns</a></li><li><a href="global.html#numberOps">numberOps</a></li><li><a href="global.html#numberTag">numberTag</a></li><li><a href="global.html#object">object</a></li><li><a href="global.html#objectCtorString">objectCtorString</a></li><li><a href="global.html#objectProto">objectProto</a></li><li><a href="global.html#objectTag">objectTag</a></li><li><a href="global.html#objectToMap">objectToMap</a></li><li><a href="global.html#objectToString">objectToString</a></li><li><a href="global.html#onFinished">onFinished</a></li><li><a href="global.html#onHeaders">onHeaders</a></li><li><a href="global.html#oneOf">oneOf</a></li><li><a href="global.html#operand">operand</a></li><li><a href="global.html#originalurl">originalurl</a></li><li><a href="global.html#overwriteMiddlewareResult">overwriteMiddlewareResult</a></li><li><a href="global.html#pairToMap">pairToMap</a></li><li><a href="global.html#param">param</a></li><li><a href="global.html#paramRegExp">paramRegExp</a></li><li><a href="global.html#parameterCount">parameterCount</a></li><li><a href="global.html#parentArray">parentArray</a></li><li><a href="global.html#parse">parse</a></li><li><a href="global.html#parseResponse">parseResponse</a></li><li><a href="global.html#parseSeverityFromString">parseSeverityFromString</a></li><li><a href="global.html#parseURL">parseURL</a></li><li><a href="global.html#parser">parser</a></li><li><a href="global.html#parsers">parsers</a></li><li><a href="global.html#parseurl">parseurl</a></li><li><a href="global.html#passport">passport</a></li><li><a href="global.html#passportRegexByCountryCode">passportRegexByCountryCode</a></li><li><a href="global.html#pathtoRegexp">pathtoRegexp</a></li><li><a href="global.html#plural">plural</a></li><li><a href="global.html#pluralization">pluralization</a></li><li><a href="global.html#pluralize">pluralize</a></li><li><a href="global.html#populate">populate</a></li><li><a href="global.html#preferredCharsets">preferredCharsets</a></li><li><a href="global.html#preferredEncodings">preferredEncodings</a></li><li><a href="global.html#preferredLanguages">preferredLanguages</a></li><li><a href="global.html#preferredMediaTypes">preferredMediaTypes</a></li><li><a href="global.html#prepareDirection">prepareDirection</a></li><li><a href="global.html#prepareDiscriminatorCriteria">prepareDiscriminatorCriteria</a></li><li><a href="global.html#prepareHandshakeDocument">prepareHandshakeDocument</a></li><li><a href="global.html#prepareObjectStackTrace">prepareObjectStackTrace</a></li><li><a href="global.html#preparePopulationOptions">preparePopulationOptions</a></li><li><a href="global.html#preparePopulationOptionsMQ">preparePopulationOptionsMQ</a></li><li><a href="global.html#prepareRequest">prepareRequest</a></li><li><a href="global.html#prevTime">prevTime</a></li><li><a href="global.html#prog">prog</a></li><li><a href="global.html#propertyIsEnumerable">propertyIsEnumerable</a></li><li><a href="global.html#proto">proto</a></li><li><a href="global.html#proxyaddr">proxyaddr</a></li><li><a href="global.html#punycode">punycode</a></li><li><a href="global.html#qescRegExp">qescRegExp</a></li><li><a href="global.html#qstring">qstring</a></li><li><a href="global.html#query">query</a></li><li><a href="global.html#quoteRegExp">quoteRegExp</a></li><li><a href="global.html#rangeParser">rangeParser</a></li><li><a href="global.html#raw">raw</a></li><li><a href="global.html#reComboMark">reComboMark</a></li><li><a href="global.html#reEmptyStringLeading">reEmptyStringLeading</a></li><li><a href="global.html#reEsTemplate">reEsTemplate</a></li><li><a href="global.html#reEscapedHtml">reEscapedHtml</a></li><li><a href="global.html#reFlags">reFlags</a></li><li><a href="global.html#reForbiddenIdentifierChars">reForbiddenIdentifierChars</a></li><li><a href="global.html#reIsBadHex">reIsBadHex</a></li><li><a href="global.html#reIsBinary">reIsBinary</a></li><li><a href="global.html#reIsOctal">reIsOctal</a></li><li><a href="global.html#reIsUint">reIsUint</a></li><li><a href="global.html#reLatin">reLatin</a></li><li><a href="global.html#reNoMatch">reNoMatch</a></li><li><a href="global.html#reRegExpChar">reRegExpChar</a></li><li><a href="global.html#reTrim">reTrim</a></li><li><a href="global.html#reTrimStart">reTrimStart</a></li><li><a href="global.html#reUnescapedHtml">reUnescapedHtml</a></li><li><a href="global.html#reUnescapedString">reUnescapedString</a></li><li><a href="global.html#read">read</a></li><li><a href="global.html#readConcern">readConcern</a></li><li><a href="global.html#readFile">readFile</a></li><li><a href="global.html#readFileSync">readFileSync</a></li><li><a href="global.html#readMany">readMany</a></li><li><a href="global.html#readPref">readPref</a></li><li><a href="global.html#readPreferenceServerSelector">readPreferenceServerSelector</a></li><li><a href="global.html#readStream">readStream</a></li><li><a href="global.html#readWireProtocolMessages">readWireProtocolMessages</a></li><li><a href="global.html#reconstructFieldPath">reconstructFieldPath</a></li><li><a href="global.html#refreshKMSCredentials">refreshKMSCredentials</a></li><li><a href="global.html#regexPunycode">regexPunycode</a></li><li><a href="global.html#registerRemoveListener">registerRemoveListener</a></li><li><a href="global.html#relative">relative</a></li><li><a href="global.html#removedMiddlewares">removedMiddlewares</a></li><li><a href="global.html#renameObjKey">renameObjKey</a></li><li><a href="global.html#req">req</a></li><li><a href="global.html#res">res</a></li><li><a href="global.html#resolveBSONOptions">resolveBSONOptions</a></li><li><a href="global.html#resolveLogPath">resolveLogPath</a></li><li><a href="global.html#resolveOptions">resolveOptions</a></li><li><a href="global.html#resolveSRVRecord">resolveSRVRecord</a></li><li><a href="global.html#rewind">rewind</a></li><li><a href="global.html#rsCombo">rsCombo</a></li><li><a href="global.html#rsComboMarksRange">rsComboMarksRange</a></li><li><a href="global.html#runAllChains">runAllChains</a></li><li><a href="global.html#runValidatorsOnUpdate">runValidatorsOnUpdate</a></li><li><a href="global.html#s">s</a></li><li><a href="global.html#sameServerSelector">sameServerSelector</a></li><li><a href="global.html#sanitizeFilter">sanitizeFilter</a></li><li><a href="global.html#save">save</a></li><li><a href="global.html#scopePaths">scopePaths</a></li><li><a href="global.html#secondaryWritableServerSelector">secondaryWritableServerSelector</a></li><li><a href="global.html#selectColor">selectColor</a></li><li><a href="global.html#semanticVersioningRegex">semanticVersioningRegex</a></li><li><a href="global.html#send">send</a></li><li><a href="global.html#serialize">serialize</a></li><li><a href="global.html#serveStatic">serveStatic</a></li><li><a href="global.html#set">set</a></li><li><a href="global.html#setCharset">setCharset</a></li><li><a href="global.html#setDefaultsOnInsert">setDefaultsOnInsert</a></li><li><a href="global.html#setDifference">setDifference</a></li><li><a href="global.html#setValue">setValue</a></li><li><a href="global.html#setup">setup</a></li><li><a href="global.html#sha1">sha1</a></li><li><a href="global.html#shouldSkipVersioning">shouldSkipVersioning</a></li><li><a href="global.html#shuffle">shuffle</a></li><li><a href="global.html#sign">sign</a></li><li><a href="global.html#simpleparser">simpleparser</a></li><li><a href="global.html#skipMiddlewareFunction">skipMiddlewareFunction</a></li><li><a href="global.html#special">special</a></li><li><a href="global.html#splitType">splitType</a></li><li><a href="global.html#startCommandDocument">startCommandDocument</a></li><li><a href="global.html#startSession">startSession</a></li><li><a href="global.html#status">status</a></li><li><a href="global.html#stringTag">stringTag</a></li><li><a href="global.html#stringToBinary">stringToBinary</a></li><li><a href="global.html#stringToPath">stringToPath</a></li><li><a href="global.html#stringifyWithMaxLen">stringifyWithMaxLen</a></li><li><a href="global.html#stringsToMap">stringsToMap</a></li><li><a href="global.html#subtypeNameRegExp">subtypeNameRegExp</a></li><li><a href="global.html#supportsRetryableWrites">supportsRetryableWrites</a></li><li><a href="global.html#symIterator">symIterator</a></li><li><a href="global.html#symbolTag">symbolTag</a></li><li><a href="global.html#tagSetMatch">tagSetMatch</a></li><li><a href="global.html#tagSetReducer">tagSetReducer</a></li><li><a href="global.html#text">text</a></li><li><a href="global.html#tick">tick</a></li><li><a href="global.html#toCollectionName">toCollectionName</a></li><li><a href="global.html#toIdentifier">toIdentifier</a></li><li><a href="global.html#toObject">toObject</a></li><li><a href="global.html#token">token</a></li><li><a href="global.html#tokenCache">tokenCache</a></li><li><a href="global.html#topologyTypeFromOptions">topologyTypeFromOptions</a></li><li><a href="global.html#transaction">transaction</a></li><li><a href="global.html#trusted">trusted</a></li><li><a href="global.html#tty">tty</a></li><li><a href="global.html#typeChecker">typeChecker</a></li><li><a href="global.html#typeOf">typeOf</a></li><li><a href="global.html#typeis">typeis</a></li><li><a href="global.html#typeofrequest">typeofrequest</a></li><li><a href="global.html#uncountables">uncountables</a></li><li><a href="global.html#unpipe">unpipe</a></li><li><a href="global.html#unset">unset</a></li><li><a href="global.html#unsign">unsign</a></li><li><a href="global.html#updateServers">updateServers</a></li><li><a href="global.html#urlencoded">urlencoded</a></li><li><a href="global.html#useColors">useColors</a></li><li><a href="global.html#utils">utils</a></li><li><a href="global.html#uuidV4">uuidV4</a></li><li><a href="global.html#validateDisplayName">validateDisplayName</a></li><li><a href="global.html#validateLoadBalancedOptions">validateLoadBalancedOptions</a></li><li><a href="global.html#validationResult">validationResult</a></li><li><a href="global.html#valueFilter">valueFilter</a></li><li><a href="global.html#vary">vary</a></li><li><a href="global.html#version">version</a></li><li><a href="global.html#versionSync">versionSync</a></li><li><a href="global.html#walkKeyPathValues">walkKeyPathValues</a></li><li><a href="global.html#walkUpdatePath">walkUpdatePath</a></li><li><a href="global.html#weakMapTag">weakMapTag</a></li><li><a href="global.html#weakSetTag">weakSetTag</a></li><li><a href="global.html#wetag">wetag</a></li><li><a href="global.html#withDefaults">withDefaults</a></li><li><a href="global.html#withLock">withLock</a></li><li><a href="global.html#wrapfunction">wrapfunction</a></li><li><a href="global.html#wrapproperty">wrapproperty</a></li><li><a href="global.html#writableServerSelector">writableServerSelector</a></li><li><a href="global.html#writeCommand">writeCommand</a></li><li><a href="global.html#writeToStream">writeToStream</a></li></ul>
+</nav>
+
+<br class="clear">
+
+<footer>
+    Documentation generated by <a href="https://github.com/jsdoc/jsdoc">JSDoc 4.0.3</a> on Thu May 16 2024 21:31:20 GMT+0200 (Mitteleuropäische Sommerzeit)
+</footer>
+
+<script> prettyPrint(); </script>
+<script src="scripts/linenumber.js"> </script>
+</body>
+</html>

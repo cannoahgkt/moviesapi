@@ -9,10 +9,6 @@ const mongoURI = process.env.MONGODB_URI;
 
 const app = express();
 const port = process.env.PORT || 3000;
-<<<<<<< HEAD
-
-=======
->>>>>>> b173789fe9802206185c76f31e844771ad941c0c
 
 app.use(bodyParser.json());
 
